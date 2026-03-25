@@ -1,0 +1,3 @@
+create abstract camera interface, check camera presense, sync image, etc, handle differently for online and offline camera sources.
+
+first we create a dummy online camera, then create a dummy offline camera class, test functionality, then do the actual implementation when hardware is ready for testing.

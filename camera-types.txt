@@ -1,0 +1,5 @@
+we need open source solutions for capturing photos at a constant interval.
+
+1. use android + termux api, capture photo at a constant period
+2. use usb webcam. standard opencv route. need to lock in camera model, check camera presence.
+3. use offline sync, configure sync method, like sdcard mount option, need to track progress and data timestamp.

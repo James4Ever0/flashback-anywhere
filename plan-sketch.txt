@@ -1,0 +1,150 @@
+# Flashback Anywhere - Code Structure Sketch Plan
+
+## Project Structure
+
+```
+flashback_anywhere/
+├── __init__.py              # Package init with version, lazy import helpers
+├── core/                    # Core package (always installed)
+│   ├── __init__.py
+│   ├── abc.py               # AbstractCamera interface
+│   ├── config.py            # YAML config loader/manager
+│   ├── registry.py          # Camera type registry (plugin pattern)
+│   ├── scheduler.py         # Interval scheduling logic
+│   └── sync.py              # Generic sync interface
+├── cameras/                 # Camera implementations (lazy loaded)
+│   ├── __init__.py          # Lazy import helpers
+│   ├── dummy/               # Dummy cameras (core, for testing)
+│   │   ├── __init__.py
+│   │   ├── online.py        # Dummy online camera
+│   │   └── offline.py       # Dummy offline camera
+│   ├── android/             # EXTRA: termux+android
+│   │   ├── __init__.py
+│   │   └── termux.py
+│   ├── usb/                 # EXTRA: opencv webcam
+│   │   ├── __init__.py
+│   │   └── opencv.py
+│   └── offline_sync/        # EXTRA: sdcard/offline sync
+│       ├── __init__.py
+│       └── sdcard.py
+└── cli.py                   # Entry point
+
+config.yaml                  # User configuration file
+pyproject.toml               # Package metadata with extras
+```
+
+## Core Design
+
+### 1. Abstract Base Class (core/abc.py)
+- `AbstractCamera` - base interface for all cameras
+- Methods: `capture()`, `is_available()`, `get_metadata()`
+- Properties: `name`, `is_online`, `supports_interval`
+
+### 2. Lazy Import Pattern (cameras/__init__.py)
+```python
+# All camera imports deferred until get_camera() called
+# Prevents importing heavy deps (opencv, termux) unless needed
+```
+
+### 3. Registry Pattern (core/registry.py)
+- `register_camera(type, import_path)` - register camera types
+- `get_camera(type, config)` - factory, handles lazy import
+- Built-in: dummy types always registered
+- Extras: registered when dependencies available
+
+### 4. Config System (core/config.py)
+```yaml
+# config.yaml structure
+camera:
+  type: "dummy_online"  # or android, usb, offline_sync
+  interval_seconds: 60
+  output_dir: "./captures"
+  enabled: true
+
+  # Type-specific config
+  android:
+    camera_id: 0
+  usb:
+    device_id: 0
+    resolution: [1920, 1080]
+  offline_sync:
+    source_path: "/mnt/sdcard"
+    sync_method: "move"  # or copy
+```
+
+### 5. Feature Flags via Extras (pyproject.toml)
+```toml
+[project.optional-dependencies]
+android = ["flashback-anywhere-termux>=0.1.0"]  # placeholder
+opencv = ["opencv-python>=4.5.0"]
+offline = []  # pure python, no extra deps
+all = ["flashback-anywhere[android,opencv,offline]"]
+```
+
+## Installation Patterns
+
+```bash
+# Minimal - core + dummy cameras only
+pip install flashback-anywhere
+
+# With specific features
+pip install flashback-anywhere[opencv]
+pip install flashback-anywhere[android]
+pip install flashback-anywhere[offline]
+
+# All features
+pip install flashback-anywhere[all]
+```
+
+## Lazy Import Implementation
+
+```python
+# cameras/__init__.py
+_IMPORT_MAP = {
+    "dummy_online": ("flashback_anywhere.cameras.dummy.online", "DummyOnlineCamera"),
+    "dummy_offline": ("flashback_anywhere.cameras.dummy.offline", "DummyOfflineCamera"),
+    "android": ("flashback_anywhere.cameras.android.termux", "TermuxCamera"),
+    "usb": ("flashback_anywhere.cameras.usb.opencv", "OpenCVCamera"),
+    "offline_sync": ("flashback_anywhere.cameras.offline_sync.sdcard", "SDCardSync"),
+}
+
+def get_camera(camera_type: str, config: dict):
+    """Lazy load camera class on demand."""
+    module_path, class_name = _IMPORT_MAP[camera_type]
+    module = importlib.import_module(module_path)
+    cls = getattr(module, class_name)
+    return cls(config)
+```
+
+## Error Handling for Missing Extras
+
+```python
+# In each extra camera module
+try:
+    import cv2
+except ImportError:
+    raise ImportError(
+        "opencv not installed. Run: pip install flashback-anywhere[opencv]"
+    )
+```
+
+## CLI Entry Point
+
+```bash
+flashback --config config.yaml
+```
+
+## Execution Flow
+
+1. CLI loads YAML config
+2. Registry resolves camera `type` to lazy import path
+3. `get_camera()` imports only the needed module
+4. Scheduler runs `camera.capture()` at configured interval
+5. Sync module handles file management based on online/offline mode
+
+## Minimal Core Principle
+
+- Core package has zero external dependencies (stdlib only)
+- Dummy cameras work out-of-the-box for testing
+- Each feature adds deps only when explicitly installed
+- Config validates required fields per camera type

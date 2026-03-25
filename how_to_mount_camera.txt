@@ -1,0 +1,7 @@
+we want egocentric view, not static camera.
+
+camera can be mounted on chest, collar, or forehead.
+
+camera can use stripe to fasten, or use google glass-like framework.
+
+camera shall be externally powered or with a large battery pack connected.
