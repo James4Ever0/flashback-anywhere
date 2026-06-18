@@ -1,0 +1,19 @@
+need to create python files for interacting with /dev/ttyACM0 (serial port provided externally, command line argument)
+
+first connect with 2000000 baud rate, send HELP and check if the response is correct
+
+if not, try 115200, wait till the time something tells you can send the mode change keyword appears within 30 seconds.
+
+if timeout just exit, or we can send the keyword, change the mode and reconnect with 2000000 baud rate again
+
+then we proceed with the following functions:
+
+- repl: user send command and get the response
+- list: list files (parse the filename and size)
+- delete: delete a file <filename>
+- upload: upload a file <source_path> <destination_path>
+- download: download a file <source_path> <destination_path>
+
+the file shall be separated from the library file.
+
+create lib_esp32cam.py and tui_esp32cam.py

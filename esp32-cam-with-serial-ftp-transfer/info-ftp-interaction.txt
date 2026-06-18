@@ -1,0 +1,65 @@
+
+[INFO] SD mounted in 4-bit mode.
+[INFO] SD Card: SDHC, Size: 29818 MB
+[INFO] Config loaded from /config.txt
+[BOOT] Waiting for serial trigger (2s)... Send 'MODE TRANSFER' to switch.
+[BOOT] No serial trigger received.
+[INFO] Camera initialized.
+
+========== ENTERING PHOTO MODE ==========
+[INFO] Saved: /picture29.jpg (46800 bytes)
+[INFO] Deep sleeping for 60 seconds...
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x1f (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0030,len:4876
+
+
+0000
+�F�p�[ERROR] Usage: LIST <absolute path>
+> [ERROR] Failed to open directory: /sdcard
+> [DIR]  logger
+[DIR]  image
+[DIR]  recorder
+[DIR]  ipcam
+[DIR]  timelapse
+[DIR]  cache
+[DIR]  language
+[DIR]  corelogger
+[FILE]    82601 bytes  picture30.jpg
+[FILE]    87024 bytes  picture31.jpg
+[FILE]    86405 bytes  picture1.jpg
+[FILE]       76 bytes  config.txt
+[FILE]    74773 bytes  picture2.jpg
+[FILE]    57348 bytes  picture3.jpg
+[FILE]    54994 bytes  picture4.jpg
+
+
+[FILE]    46800 bytes  picture29.jpg
+> [ERROR] Failed to open file: config.txt
+> SIZE: 76
+# ESP32-CAM Combined Sketch Config
+mode=photo
+interval=60
+pictureNumber=29
+> [OK] Deleted: /picture29.jpg
+> [DIR]  logger
+[DIR]  image
+
+
+[FILE]    71670 bytes  picture26.jpg
+[FILE]    47434 bytes  picture27.jpg
+[FILE]    44807 bytes  picture28.jpg
+> Available commands:
+  LIST   <path>              - List directory contents
+  READ   <file_path>         - Read file and send binary
+  STORE  <file_path> <size>  - Write file from binary data
+  DELETE <file_path>         - Delete a file
+  MODE   PHOTO|TRANSFER      - Switch device mode
+  HELP                       - Show this message
+> [OK] Switching to PHOTO mode...
+
+========== ENTERING PHOTO MODE ==========

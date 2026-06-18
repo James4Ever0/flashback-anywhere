@@ -1,0 +1,10 @@
+read ../python-ftp-interaction
+read how-to-receive-files-programmatically.txt
+
+understand its command syntax. but instead of using pyserial, use web. use minimal ftp libraries to make it work.
+
+you need to handle the connection (setting up network interface, setting wifi password, ftp password, etc), read these from a file, so we only need to pass a file to the python script like -c config.yaml.
+
+create the scripts under python-ftp-wifi-client folder.
+
+plan first. write plan at python-ftp-wifi-client/plan.txt

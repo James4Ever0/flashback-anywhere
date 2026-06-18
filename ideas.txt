@@ -1,0 +1,15 @@
+ideas on mode change:
+
+- always on transfer, abolish deep sleep, use light sleep or none, can transfer photo and audio as long as the device is on with bluetooth, wifi or serial
+- use another special chip to perform power relay and sd card switching, switch from sd card reader or just forward sd to the cam board and power the cam board on
+- check if board has vbus pinout and if so design a special pcb wiring the vbus to another gpio with two resistors. vbus -> r1 -> [gpio_x, r2] -> gnd
+- wire en with ground and a button to perform reset
+- use a physical toggle switch on battery
+- set baud rate to a fixed rate between text mode and transfer mode, do not switch baud rate.
+
+questions:
+
+- is there a lock for performing io operations?
+- can we log background tasks into different log files with time, to prevent issues of polluting the serial ftp interface? we can purge and recreate those logs if file size greater than x, or just to switch off the serial output during serial ftp transfer mode for background tasks (but no more deep sleep), and design a timeout function for ftp transfer mode, if no command after 30 seconds switch back to photo and audio record mode?
+- shall we turn serial off if mass storage device is on? what about unplug and replug the device? any extra step for successful reconnection when device is on battery?
+- we shall detect if the sd card is full. recording audio & photos may fail in the midway, but we need to continue the loop anyway till explicit freeing the space through deletion. 

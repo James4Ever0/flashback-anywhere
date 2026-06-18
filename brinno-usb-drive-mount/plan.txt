@@ -1,0 +1,25 @@
+1. Create lib.py — core library module with these functions:
+   - list_usb_devices(keyword) -> list devices from /dev/disk/by-id/usb-* matching keyword
+   - get_device_size(device_path) -> return size in bytes
+   - filter_devices(devices, min_size_mb=128) -> exclude devices smaller than threshold
+   - unmount_device(device_path) -> unmount if mounted
+   - mount_device(device_path, mount_point) -> mount to given path
+   - write_device_info(mount_point, name, uuid) -> create device_info.cfg with name, uuid, last_sync_time
+   - generate_uuid() -> create a UUID string
+
+2. Create tui.py — terminal UI module:
+   - present device selection menu to user
+   - prompt for device name (non-empty validation)
+   - prompt for mount point (with default)
+   - display progress/status messages
+   - call lib.py functions to perform operations
+
+3. Main flow in tui.py:
+   - list and filter USB devices by keyword
+   - filter out <128MB devices
+   - show selectable list to user
+   - unmount selected device
+   - mount to configured path
+   - prompt for device name
+   - generate UUID
+   - write device_info.cfg

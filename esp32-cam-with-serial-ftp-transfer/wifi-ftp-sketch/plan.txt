@@ -1,0 +1,46 @@
+WiFi + FTP Server Sketch for ESP32-CAM
+
+1.  Mode Switch
+    - Reuse the boot-time mode-switch logic from ../CombinedSketch.
+    - Two modes: PHOTO (deep-sleep camera) and WIFI_FTP (WiFi + FTP server).
+    - Triggers: charging pin HIGH, button LOW at boot, serial command during boot window.
+
+2.  Serial Configuration Protocol (WiFi/FTP config only — NO serial file transfer)
+    - IMPORTANT: This sketch does NOT include the serial file transfer protocol
+      (LIST / READ / STORE / DELETE) from CombinedSketch. File transfer is done
+      exclusively over WiFi via FTP.
+    - WIFI_SSID <ssid>        -- set WiFi SSID (stored in SD config)
+    - WIFI_PASS <password>    -- set WiFi password (stored in SD config)
+    - WIFI_START              -- connect to WiFi using stored SSID/pass
+    - WIFI_STOP               -- disconnect WiFi
+    - FTP_PORT <port>         -- set FTP server port (default 21)
+    - FTP_USER <username>     -- set FTP username
+    - FTP_PASS <password>     -- set FTP password
+    - FTP_START               -- start the FTP server (requires SD mounted + WiFi connected)
+    - FTP_STOP                -- stop the FTP server
+    - FTP_STATUS              -- print WiFi status, IP, FTP running state
+    - MODE PHOTO              -- stop WiFi/FTP and return to photo mode (deep sleep)
+
+3.  File / Library to Download
+    - Library: SimpleFTPServer (formerly ESP8266FtpServer) by Renzo Mischianti
+      - Available in Arduino Library Manager
+      - Supports ESP32 + SD_MMC out of the box
+      - One class: FtpServer, with user()/pass()/begin() / handleFTP()
+
+4.  FTP Server Guard
+    - FTP server can ONLY be started when:
+      a) SD card is successfully mounted (sdReady == true)
+      b) WiFi is connected (WiFi.status() == WL_CONNECTED)
+    - If either condition fails, reply with [ERROR] and do not call ftp.begin().
+
+5.  Configuration Persistence
+    - Store WiFi + FTP settings in /wifi_ftp_config.txt on SD card.
+    - Load at boot when wakeup cause is ESP_SLEEP_WAKEUP_UNDEFINED.
+    - Format: key=value, same parser as CombinedSketch.
+
+6.  Dependencies to Install
+    - SimpleFTPServer by Renzo Mischianti (Library Manager)
+    - Built-in: WiFi, SD_MMC, FS
+
+7.  File to Write Here
+    - wifi-ftp-sketch.ino   (only this file; library pulled from Arduino Library Manager)

@@ -1,0 +1,7 @@
+fill code in bluetooth-ftp-with-cam-capture.ino in the void loop() function
+
+read file at /home/jamesbrown/Desktop/works/flashback-anywhere/esp32-cam-with-serial-ftp-transfer/refactored_configurable_timelapse_sketch/refactored_configurable_timelapse_sketch.ino
+
+write camera capture loop here, set the interval to a fixed value first, like 30 seconds
+the value should be configurable from the sd card, separate from bluetooth ftp
+do not block the bluetooth ftp task, shall share the same io lock

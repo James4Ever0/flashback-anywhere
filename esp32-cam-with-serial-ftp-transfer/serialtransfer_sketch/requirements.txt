@@ -1,0 +1,5 @@
+# Python client dependencies
+# Install with: pip install -r requirements.txt
+
+pyserial>=3.5
+pySerialTransfer==2.1.1

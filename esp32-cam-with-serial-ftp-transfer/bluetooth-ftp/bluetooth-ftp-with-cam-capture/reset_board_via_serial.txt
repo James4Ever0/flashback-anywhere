@@ -1,0 +1,130 @@
+ESP32 Reset via Serial Interface — Findings
+============================================
+Source: /usr/share/esptool/esptool.py (installed esptool)
+
+Q1: Is "reset via RST pin" issued from serial data or the bootloader?
+------------------------------------------------------------------------
+NO. The message "Hard resetting via RTS pin..." is printed by esptool.py
+(the host PC flashing tool), NOT by the ESP32 bootloader.
+
+The reset is NOT triggered by sending a command byte over TX/RX.
+It is triggered by toggling the USB-serial converter's **control lines**
+(DTR and RTS), which are wired through capacitors to the ESP32's EN/RST
+and GPIO0 pins on most dev boards.
+
+
+Q2: How does the auto-reset circuit work?
+-----------------------------------------
+Typical ESP32 dev board circuit (capacitor-coupled):
+
+    USB-Serial Converter          ESP32
+    ┌─────────────┐              ┌──────┐
+    │ DTR         │──┬─[C1]─────►│ GPIO0│◄──[10k]──► 3.3V (pull-up)
+    │ RTS         │──┬─[C2]─────►│ EN   │◄──[10k]──► 3.3V (pull-up)
+    └─────────────┘              └──────┘
+
+DTR and RTS are ACTIVE-LOW signals:
+  - True  (asserted)  = pin @ 0V
+  - False (deasserted) = pin @ VCC
+
+The capacitors create a momentary low pulse when the line transitions,
+which pulls the ESP32 pin low briefly. The pull-up resistor then returns
+the pin to 3.3V.
+
+
+Q3: Sequence to enter DOWNLOAD mode (flashing)
+----------------------------------------------
+From esptool.py _connect_attempt():
+
+  1. DTR=False  (IO0=HIGH via pull-up)
+     RTS=True   (EN=LOW, chip held in reset)
+     sleep(0.1)
+
+  2. DTR=True   (IO0=LOW)
+     RTS=False  (EN=HIGH, chip released from reset)
+     sleep(0.05)
+     → GPIO0 is LOW when EN rises → bootloader/download mode
+
+  3. DTR=False  (IO0=HIGH, clean up)
+
+This is the "reset via RST pin" you see during upload.
+The bootloader starts and waits for sync commands on UART.
+
+
+Q4: Sequence for NORMAL reset (no download mode)
+------------------------------------------------
+From esptool.py hard_reset():
+
+  1. RTS=True   (EN=LOW, chip held in reset)
+     sleep(0.1)
+
+  2. RTS=False  (EN=HIGH, chip released from reset)
+     → GPIO0 is HIGH (pulled up) when EN rises → normal boot from flash
+
+Note: DTR is left alone (False), so GPIO0 stays HIGH via its pull-up.
+This is what esptool does AFTER flashing with --after hard_reset.
+
+
+Q5: Can I trigger reset from software?
+--------------------------------------
+YES — by controlling DTR/RTS on the serial port from your PC program.
+
+Python example (using pyserial):
+
+  import serial
+  import time
+
+  ser = serial.Serial('/dev/ttyUSB0', 115200)
+
+  # --- Normal reset (boot from flash) ---
+  ser.setDTR(False)   # GPIO0 = HIGH (leave alone)
+  ser.setRTS(True)    # EN = LOW (assert reset)
+  time.sleep(0.1)
+  ser.setRTS(False)   # EN = HIGH (release reset)
+  # → ESP32 boots normally from flash
+
+  # --- Enter download mode ---
+  ser.setDTR(False)   # GPIO0 = HIGH
+  ser.setRTS(True)    # EN = LOW
+  time.sleep(0.1)
+  ser.setDTR(True)    # GPIO0 = LOW
+  ser.setRTS(False)   # EN = HIGH
+  time.sleep(0.05)
+  ser.setDTR(False)   # GPIO0 = HIGH (clean up)
+  # → ESP32 enters bootloader, ready for flashing
+
+Arduino/C++ (on PC side) uses platform-specific APIs:
+  - Linux: ioctl(TIOCMSET) with TIOCM_DTR / TIOCM_RTS flags
+  - Windows: EscapeCommFunction() with SETDTR / CLRDTR / SETRTS / CLRRTS
+  - macOS: similar to Linux with ioctl()
+
+
+Q6: Can the ESP32 reset itself via serial?
+------------------------------------------
+NO. The ESP32 cannot trigger its own EN/RST pin through its own UART.
+The reset signal must come from an external source (the USB-serial chip
+or another MCU) driving the EN pin low.
+
+However, the ESP32 CAN trigger a software reset internally:
+  - esp_restart()  → CPU reset, reboots from flash
+  - ESP.restart()  → Arduino wrapper
+  - WDT timeout    → watchdog reset
+
+These are internal CPU resets, not related to the RTS/DTR hardware signal.
+
+
+Summary Table
+-------------
+Action                | DTR (GPIO0) | RTS (EN) | Result
+----------------------|-------------|----------|---------------------------
+Hold reset            | Don't care  | True     | Chip in reset
+Normal reset          | False       | True→False| Boot from flash
+Enter download mode   | False→True→False | True→False| Boot to bootloader
+
+
+Key Takeaway
+------------
+The "reset via RST pin" is a HARDWARE signal (RTS line toggle), not a
+serial command. You can trigger it from software on the HOST side by
+controlling the serial port's DTR/RTS control lines, but the ESP32
+cannot trigger it on itself through its own UART data lines.

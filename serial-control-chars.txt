@@ -1,0 +1,2 @@
+newline can separate input commands 
+if not during file upload or download you can always use newline, else use idle timeout along with char maxlimit.

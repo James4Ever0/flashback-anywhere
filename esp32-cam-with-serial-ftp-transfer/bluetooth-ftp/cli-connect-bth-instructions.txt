@@ -1,0 +1,263 @@
+# Bluetooth Command-Line Connection Instructions
+
+Connect to the ESP32-CAM Bluetooth FTP server from Linux without using any GUI.
+
+---
+
+## Prerequisites
+
+- Linux with BlueZ (`bluetoothctl`, `rfcomm`)
+- `pyserial` installed: `pip install pyserial`
+- ESP32-CAM flashed with `BluetoothFTPServer.ino`
+- Know your ESP32 MAC address (printed at boot on Serial Monitor)
+
+---
+
+## One-Time Setup (First Connection)
+
+### 1. Find the ESP32 MAC address
+
+Power on the ESP32 and check the Serial Monitor (115200 baud). Look for:
+
+```
+[INFO] Bluetooth 'ESP32-FTP' ready. MAC: F0:24:F9:F7:35:42
+```
+
+Or scan from the PC:
+
+```bash
+bluetoothctl scan on
+# Wait 10-20 seconds until you see:
+# [NEW] Device F0:24:F9:F7:35:42 ESP32-FTP
+bluetoothctl scan off
+```
+
+Save the MAC. All commands below use `F0:24:F9:F7:35:42` — replace with yours.
+
+### 2. Pair the device (all in terminal, no GUI)
+
+Run `bluetoothctl` in interactive mode. The key is `agent on` + `default-agent` — this makes `bluetoothctl` handle the pairing confirmation in the terminal itself, so no GUI dialog ever pops up.
+
+```bash
+bluetoothctl
+```
+
+Inside the `bluetoothctl>` prompt:
+
+```
+[bluetooth]# agent on
+Agent registered
+[bluetooth]# default-agent
+Default agent request successful
+[bluetooth]# pair F0:24:F9:F7:35:42
+Attempting to pair with F0:24:F9:F7:35:42
+[CHG] Device F0:24:F9:F7:35:42 Connected: yes
+Request confirmation
+[agent] Confirm passkey 123456 (yes/no): yes          <-- type this
+[CHG] Device F0:24:F9:F7:35:42 Paired: yes
+Pairing successful
+[bluetooth]# trust F0:24:F9:F7:35:42
+[CHG] Device F0:24:F9:F7:35:42 Trusted: yes
+Changing F0:24:F9:F7:35:42 trust succeeded
+[bluetooth]# quit
+```
+
+**Why this works:**
+- `agent on` registers `bluetoothctl` as the pairing agent
+- `default-agent` tells BlueZ to route all pairing prompts to `bluetoothctl`
+- The "Confirm passkey" prompt appears **in the terminal** — you type `yes`
+- No GUI window ever appears
+
+If pairing fails with "Authentication failed", remove the stale bond first:
+
+```
+[bluetooth]# remove F0:24:F9:F7:35:42
+[bluetooth]# pair F0:24:F9:F7:35:42
+```
+
+#### Non-interactive one-liner (for scripts)
+
+```bash
+{ echo "agent on"; echo "default-agent"; echo "pair F0:24:F9:F7:35:42"; echo "yes"; echo "trust F0:24:F9:F7:35:42"; echo "quit"; } | bluetoothctl
+```
+
+Or with `expect`:
+
+```bash
+expect -c '
+spawn bluetoothctl
+expect "#"
+send "agent on\r"
+expect "#"
+send "default-agent\r"
+expect "#"
+send "pair F0:24:F9:F7:35:42\r"
+expect "Confirm passkey"
+send "yes\r"
+expect "#"
+send "trust F0:24:F9:F7:35:42\r"
+expect "#"
+send "quit\r"
+'
+```
+
+### 3. Trust the device
+
+This allows reconnections without repeating the pairing dialog:
+
+```bash
+bluetoothctl trust F0:24:F9:F7:35:42
+```
+
+### 4. Bind the RFCOMM virtual serial port
+
+```bash
+rfcomm bind 0 F0:24:F9:F7:35:42
+```
+
+Verify it exists:
+```bash
+ls -la /dev/rfcomm0
+# Should show: /dev/rfcomm0 -> ...
+```
+
+### 5. Connect with the Python client
+
+```bash
+python3 bt_ftp_client.py /dev/rfcomm0
+```
+
+You should see:
+```
+[OK] Connected to /dev/rfcomm0
+Entering REPL. Type !quit to exit.
+esp32-bt>
+```
+
+---
+
+## Reconnection (After Disconnect or Power Cycle)
+
+**The golden rule:** `/dev/rfcomm0` becomes a "zombie" after any disconnect. Always release and rebind before reconnecting.
+
+```bash
+# 1. Release stale binding
+rfcomm release 0
+
+# 2. Rebind
+rfcomm bind 0 F0:24:F9:F7:35:42
+
+# 3. Connect
+python3 bt_ftp_client.py /dev/rfcomm0
+```
+
+---
+
+## Common Errors and Fixes
+
+### Error: `flush took 30000ms` then `device disconnected`
+
+**Cause:** `/dev/rfcomm0` exists but the underlying Bluetooth SPP session is dead. pyserial's `flush()` blocks waiting for a peer that isn't there.
+
+**Fix:**
+```bash
+rfcomm release 0
+rfcomm bind 0 F0:24:F9:F7:35:42
+```
+
+### Error: `SerialException: device reports readiness to read but returned no data`
+
+**Cause:** Same as above — the RFCOMM device file is stale.
+
+**Fix:** Same — `rfcomm release 0` then `rfcomm bind 0 <MAC>`.
+
+### Error: ESP32 Serial shows `Pairing FAILED` repeatedly
+
+**Cause:** The ESP32 deleted its bond key (old code had `deleteAllBondedDevices()`), but the PC still has the old key. Every auto-connect attempt from BlueZ fails authentication.
+
+**Fix on PC:**
+```bash
+bluetoothctl remove F0:24:F9:F7:35:42
+bluetoothctl pair F0:24:F9:F7:35:42
+bluetoothctl trust F0:24:F9:F7:35:42
+```
+
+### Error: `bluetoothctl` hangs or doesn't find the device
+
+**Fix:**
+```bash
+# Reset the Bluetooth adapter
+sudo systemctl restart bluetooth
+
+# Or power cycle the adapter
+bluetoothctl power off
+bluetoothctl power on
+bluetoothctl scan on
+```
+
+---
+
+## Full Shell Script (Save as `connect.sh`)
+
+```bash
+#!/bin/bash
+MAC="F0:24:F9:F7:35:42"  # <-- CHANGE THIS
+
+# Release stale binding if it exists
+sudo rfcomm release 0 2>/dev/null
+
+# Bind fresh
+sudo rfcomm bind 0 "$MAC"
+
+# Check
+if [ ! -e /dev/rfcomm0 ]; then
+    echo "Failed to create /dev/rfcomm0"
+    exit 1
+fi
+
+echo "RFCOMM bound. Connecting..."
+python3 bt_ftp_client.py /dev/rfcomm0
+
+# Cleanup after client exits
+sudo rfcomm release 0 2>/dev/null
+```
+
+Make executable: `chmod +x connect.sh`
+Run: `./connect.sh`
+
+---
+
+## Quick Reference: bluetoothctl Commands
+
+```bash
+bluetoothctl scan on              # Discover devices
+bluetoothctl scan off             # Stop discovery
+bluetoothctl devices              # List discovered devices
+bluetoothctl paired-devices       # List paired devices
+bluetoothctl pair <MAC>           # Pair
+bluetoothctl trust <MAC>          # Auto-accept future connections
+bluetoothctl connect <MAC>        # Connect (SPP profile)
+bluetoothctl disconnect <MAC>     # Disconnect
+bluetoothctl remove <MAC>         # Unpair / delete bond
+bluetoothctl info <MAC>           # Show device info
+```
+
+---
+
+## Quick Reference: rfcomm Commands
+
+```bash
+rfcomm bind 0 <MAC>               # Create /dev/rfcomm0 bound to device
+rfcomm release 0                  # Destroy /dev/rfcomm0
+rfcomm show 0                     # Show binding status
+rfcomm connect 0 <MAC>            # Direct connect (often fails, use bind instead)
+```
+
+---
+
+## Notes
+
+- The baud rate passed to pyserial (`115200`) is ignored by Bluetooth SPP. The actual speed is determined by the Bluetooth link (~1 Mbps).
+- After pairing + trust, future reconnections should only need `rfcomm release 0 && rfcomm bind 0 <MAC>`.
+- If the ESP32 is reflashed, you may need to `bluetoothctl remove` and re-pair, because the ESP32's bonding database is reset.
+- Use `!quit` in the Python REPL to exit cleanly. Do NOT use `/exit` — that sends a literal `/exit` command to the FTP server, which doesn't understand it.

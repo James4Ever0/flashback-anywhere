@@ -1,0 +1,313 @@
+# Minimal Bluetooth FTP Background Task Service Plan
+
+## Scope
+
+A single-purpose Arduino sketch: a Bluetooth Classic SPP server that runs as a **FreeRTOS background task**, leaving `loop()` completely empty. The service exposes a minimal FTP-like command set over Bluetooth Serial for SD card file operations. No camera, no audio, no photo mode — Bluetooth FTP only.
+
+---
+
+## Architecture
+
+```
++------------------+     Bluetooth SPP      +-------------------------+
+|  Python Client   |  <=================>   |  ESP32-CAM              |
+|  (pyserial over  |     PIN-protected      |  Core 0:                |
+|   RFCOMM/PTY)    |                        |    taskBluetoothFTP()   |
+|                  |                        |      - BT listen        |
+|                  |                        |      - command parse    |
+|                  |                        |      - SD I/O (mutex)   |
+|                  |                        |  Core 1:                |
+|                  |                        |    loop() {}  (idle)    |
++------------------+                        +-------------------------+
+```
+
+---
+
+## INO File Structure
+
+```cpp
+#include "BluetoothSerial.h"
+#include "FS.h"
+#include "SD_MMC.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// --- Objects & Handles ---
+BluetoothSerial SerialBT;
+static SemaphoreHandle_t sdMutex;
+
+// --- Forward Declares ---
+void taskBluetoothFTP(void* parameter);
+bool cmdList(const char* path);
+bool cmdRead(const char* path);
+bool cmdStore(const char* path, size_t size);
+bool cmdDelete(const char* path);
+bool cmdHelp();
+
+// --- setup() ---
+void setup() {
+    Serial.begin(115200);                    // wired debug (optional)
+    sdMutex = xSemaphoreCreateMutex();
+
+    // Mount SD
+    if (!SD_MMC.begin("/sdcard", true)) {
+        SD_MMC.begin();                      // fallback 1-bit
+    }
+
+    // Read PIN from /btpin.txt if exists, else default "0000"
+    String pin = readPinFromFile();
+    SerialBT.setPin(pin.c_str());
+    SerialBT.enableSSP(false);               // force legacy PIN pairing
+    SerialBT.begin("ESP32-FTP");             // device name
+
+    // Spawn the FTP service on Core 0
+    xTaskCreatePinnedToCore(
+        taskBluetoothFTP,
+        "btftp",
+        8192,                                // stack words
+        NULL,
+        1,                                   // priority
+        NULL,
+        0                                    // Core 0
+    );
+}
+
+// --- EMPTY loop() ---
+void loop() {
+    // Intentionally empty.
+    // All work lives in taskBluetoothFTP on Core 0.
+    // Core 1 is free for future tasks or left idle.
+    vTaskDelay(portMAX_DELAY);
+}
+```
+
+**Why empty `loop()`?**
+- The Arduino `loop()` function runs on Core 1 at priority 1 by default in ESP32 Arduino core.
+- By leaving it empty (or sleeping forever), we do not consume CPU cycles.
+- The Bluetooth FTP service is a dedicated FreeRTOS task pinned to Core 0, completely independent of `setup()`/`loop()` flow.
+- This makes the sketch a true background service: it does not block, it does not poll, it event-drives on Bluetooth data.
+
+---
+
+## Background Task: `taskBluetoothFTP()`
+
+```
+taskBluetoothFTP:
+  forever:
+    if SerialBT.hasClient():
+        while SerialBT.available():
+            accumulate bytes into line buffer until '\n'
+            if complete line:
+                parse command token
+                dispatch to handler:
+                    HELP    -> cmdHelp()
+                    LIST    -> cmdList(path)
+                    READ    -> cmdRead(path)
+                    STORE   -> cmdStore(path, size)
+                    DELETE  -> cmdDelete(path)
+                    SETPIN  -> cmdSetPin(newPin)
+                    BTINFO  -> cmdBtInfo()
+                send prompt "> "
+    else:
+        // no client connected
+        vTaskDelay(100ms)   // yield, avoid busy-spin
+```
+
+**Key design points:**
+- **Blocking read**: Inside `hasClient()`, we accumulate bytes. `SerialBT.read()` is non-blocking; we rely on the inner `while(available())` loop and the outer `vTaskDelay` when idle.
+- **No deep sleep**: Since this is a persistent background service, we never call `esp_deep_sleep_start()`.
+- **Power**: Bluetooth radio stays on. Expect ~30–50 mA baseline.
+
+---
+
+## SD Mutex Wrapping
+
+Every command handler that touches the SD card follows this exact pattern:
+
+```
+handler:
+    xSemaphoreTake(sdMutex, portMAX_DELAY)
+    open file / directory
+    perform operation
+    close file
+    xSemaphoreGive(sdMutex)
+    respond over SerialBT
+```
+
+**Chunked STORE/READ for fairness:**
+- `STORE`: Read 1KB chunks from Bluetooth, acquire mutex, write 1KB to SD, release mutex, repeat until `size` bytes consumed. This prevents a large file upload from monopolizing the SD bus.
+- `READ`: Acquire mutex, read 1KB from SD, release mutex, send over Bluetooth, repeat. Same fairness rationale.
+
+---
+
+## Command Set (Minimal)
+
+| Command | Arguments | Response |
+|---------|-----------|----------|
+| `HELP` | — | Multi-line command list |
+| `LIST <path>` | absolute path | `[DIR] name` or `[FILE] size bytes name` per line |
+| `READ <path>` | absolute path | `SIZE: N\n` + binary chunks + `\x04` (EOT) |
+| `STORE <path> <size>` | absolute path, byte count | `[OK] Ready to receive` → client sends binary → `[OK] Stored` |
+| `DELETE <path>` | absolute path | `[OK] Deleted` or `[ERROR] ...` |
+| `SETPIN <pin>` | 4-digit PIN | `[OK] PIN saved. Reboot to apply.` |
+| `BTINFO` | — | device name, MAC, PIN, client connected state |
+
+All responses terminate with `\n` and end with the prompt `> `.
+
+---
+
+## Python Client Questions & Answers
+
+### Q1: Does pyserial need to set a baud rate for Bluetooth?
+
+**Short answer:** Yes — you must pass a baud rate to `pyserial.Serial()`, but the value is **ignored** by the Bluetooth stack.
+
+**Explanation:**
+- When the OS pairs with the ESP32 over Bluetooth Classic SPP, it creates a virtual serial port (e.g., `/dev/rfcomm0`, `/dev/tty.ESP32-FTP`, `COM5`).
+- The actual data rate is negotiated by the Bluetooth RFCOMM layer (~1 Mbps), not by a UART clock.
+- pyserial requires a baud rate argument for API compatibility. Pass any standard value — `115200`, `9600`, or even `2000000`. The driver discards it.
+- **Code:**
+  ```python
+  import serial
+  # baud is a dummy value for Bluetooth SPP virtual serial ports
+  bt = serial.Serial('/dev/rfcomm0', baudrate=115200, timeout=10)
+  ```
+
+### Q2: Can pyserial connect to a PTY (pseudo-terminal)?
+
+**Short answer:** Yes. PTYs are excellent for local testing without real hardware.
+
+**Explanation:**
+- A PTY is a pseudo-terminal pair: a **master** side and a **slave** side.
+- The slave side appears as a regular terminal device (e.g., `/dev/pts/7`) and behaves exactly like a serial port from pyserial's perspective.
+- This lets you:
+  1. Run a mock ESP32 script on the master side that speaks the FTP protocol.
+  2. Point the real Python client at the slave side.
+  3. Test the entire client logic without physical hardware.
+
+**How to create a PTY pair:**
+
+```python
+import os
+import pty
+
+master_fd, slave_fd = pty.openpty()
+slave_name = os.ttyname(slave_fd)
+print(f"Slave PTY: {slave_name}")
+# slave_name looks like: /dev/pts/7
+```
+
+**How to connect pyserial to the PTY slave:**
+
+```python
+import serial
+
+# No code changes needed in pyserial — it treats PTY exactly like a serial port
+mock_esp = serial.Serial('/dev/pts/7', baudrate=115200, timeout=1)
+
+# Now use the same API as a real Bluetooth connection:
+mock_esp.write(b"HELP\n")
+response = mock_esp.read(1024)
+```
+
+**Full mock setup for testing:**
+
+Terminal A (mock ESP32 server):
+```python
+import os, pty, serial, threading
+
+master_fd, slave_fd = pty.openpty()
+print(f"Connect client to: {os.ttyname(slave_fd)}")
+
+ser = serial.Serial(os.ttyname(master_fd), baudrate=115200, timeout=0.1)
+
+while True:
+    line = ser.readline()
+    if not line:
+        continue
+    cmd = line.decode().strip()
+    if cmd == "HELP":
+        ser.write(b"Available commands:\n  LIST READ STORE DELETE\n> ")
+    elif cmd.startswith("LIST"):
+        ser.write(b"[FILE] 1234 bytes test.txt\n> ")
+    # ... etc
+```
+
+Terminal B (real client):
+```python
+import serial
+bt = serial.Serial('/dev/pts/7', baudrate=115200, timeout=5)
+bt.write(b"HELP\n")
+print(bt.read(1024))
+```
+
+**Any code changes needed?** No. pyserial's `Serial()` accepts any file descriptor path that supports `termios` (Linux/macOS) or COM port handles (Windows). PTYs satisfy this on Linux/macOS. On Windows, use `com0com` or similar virtual serial port drivers instead of PTY.
+
+---
+
+## Python Client (Minimal)
+
+Same `pyserial` dependency, same API as the wired serial client. The only difference is the port path:
+
+| Platform | Port Path | Setup |
+|----------|-----------|-------|
+| Linux (paired) | `/dev/rfcomm0` | `sudo rfcomm bind 0 <ESP32_MAC>` |
+| Linux (PTY mock) | `/dev/pts/N` | `pty.openpty()` |
+| macOS (paired) | `/dev/tty.ESP32-FTP` | Appears automatically after pairing |
+| Windows (paired) | `COM5` (varies) | Appears in Device Manager |
+
+The `lib_esp32cam.py` from the wired-serial project requires **zero code changes**. Just instantiate with the Bluetooth port:
+
+```python
+from lib_esp32cam import ESP32CamSerial
+
+# Before running: pair the ESP32 in OS Bluetooth settings, PIN = "0000"
+client = ESP32CamSerial('/dev/rfcomm0')
+client.connect()       # same two-phase logic (HELP -> check prompt)
+files = client.list_files("/sdcard")
+client.download("/sdcard/picture1.jpg", "./picture1.jpg")
+client.disconnect()
+```
+
+---
+
+## File Layout
+
+```
+bluetooth-ftp/
+├── simple-bluetooth-ftp-background-service-plan.txt   # this file
+├── BluetoothFTPServer.ino                             # main sketch (to be written)
+│   ├── setup()                                        # init BT, SD, mutex, spawn task
+│   ├── loop() {}                                      # empty
+│   └── taskBluetoothFTP()                             # background task
+├── sd_lock.h / .cpp                                   # sdMutex wrapper helpers
+├── ftp_commands.h / .cpp                              # LIST, READ, STORE, DELETE, HELP
+├── bt_pin.h / .cpp                                    # read /btpin.txt, SETPIN handler
+└── python_client/
+    └── bt_ftp_client.py                               # same as wired client, different port
+```
+
+---
+
+## Build & Flash Checklist
+
+- [ ] Board: AI-Thinker ESP32-CAM
+- [ ] Partition: Huge APP (no OTA)
+- [ ] Upload speed: 921600
+- [ ] ESP32 Arduino Core >= 2.0.14
+- [ ] No external libraries needed (BluetoothSerial + SD_MMC + FreeRTOS are built-in)
+- [ ] After flash: open phone Bluetooth settings, pair with "ESP32-FTP", enter PIN
+- [ ] Verify: open Serial Bluetooth Terminal app, send `HELP`, see response
+
+---
+
+## Power & Behavior Notes
+
+| State | Current Draw | Notes |
+|-------|--------------|-------|
+| Idle, BT on, no client | ~30 mA | Radio advertising / listening |
+| BT connected, idle | ~40 mA | RFCOMM link active |
+| BT file transfer | ~50–80 mA | Radio + SD write |
+| `loop()` empty with `vTaskDelay(portMAX_DELAY)` | ~0 mA extra | Core 1 blocked, no busy loop |
+
+Since this is a dedicated FTP service (no deep sleep, no photo mode), plan for a continuous power source or a large battery.

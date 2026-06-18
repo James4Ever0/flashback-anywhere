@@ -1,0 +1,244 @@
+# Bluetooth Pairing Fix Plan
+
+## Problem Summary
+
+Ubuntu desktop uses **Secure Simple Pairing (SSP)** which generates a random 6-digit PIN on both sides. The ESP32 `setPin()` legacy API only works with **legacy PIN-code pairing** — which modern Linux, Windows, and macOS no longer support for Bluetooth Classic SPP. The result:
+- Ubuntu shows a 6-digit number and asks "does this match?"
+- User cannot type their own fixed PIN
+- Connection drops because neither side confirms the SSP numeric comparison
+
+## Root Cause
+
+| Feature | Legacy Pairing | Secure Simple Pairing (SSP) |
+|---------|---------------|----------------------------|
+| PIN type | User-chosen fixed PIN (4-16 digits) | Random 6-digit numeric comparison |
+| Who enters it | Human types on both devices | Stack generates it; human only confirms match |
+| `setPin()` | Works | Ignored |
+| `enableSSP(false,false)` | Attempts to disable | Modern OSes still prefer SSP; may ignore or fallback |
+| Ubuntu support | Removed for SPP in BlueZ 5.x | Default and only path |
+
+**Conclusion:** We cannot force a fixed legacy PIN on modern Linux. We must work *with* SSP.
+
+---
+
+## Solution: Boot-Button Confirm + Serial Debug
+
+Use the ESP32-CAM **BOOT button (GPIO0)** as the physical confirmation for SSP pairing. The ESP32 displays the 6-digit code over wired Serial/USB, and the user presses the button to confirm.
+
+### Pairing Flow
+
+```
+User (Ubuntu)                    ESP32-CAM
+    |                                |
+    |-- Click "Pair" in BT settings  |
+    |------------------------------->|
+    |                                |
+    |    [SSP numeric comparison]    |
+    |-- random 6-digit number ----- >|
+    |                                |
+    |                            onConfirmRequest(123456)
+    |                            print "[BT] Pairing code: 123456"
+    |                            print "[BT] Press BOOT button to confirm"
+    |                                |
+    |                            [wait for GPIO0 LOW]
+    |                            confirmReply(true)
+    |                                |
+    |         [bonding completes]    |
+    | <-----------------------------|
+    |                                |
+    |-- Serial Bluetooth Terminal  -->|
+    |    HELP                        |
+```
+
+After the first successful pairing+bonding, Ubuntu remembers the device. Future connections do **not** require re-pairing or button presses.
+
+---
+
+## Implementation Changes
+
+### 1. Add Serial Debug Prints to `BluetoothFTPServer.ino`
+
+Add a `SerialBT` event callback block in `setup()` after `SerialBT.begin()`:
+
+```cpp
+// --- Debug: print all Bluetooth state changes to wired Serial ---
+SerialBT.onConnect([](String addr) {
+    Serial.printf("[BT] Client connected: %s\n", addr.c_str());
+});
+
+SerialBT.onDisconnect([](String addr) {
+    Serial.printf("[BT] Client disconnected: %s\n", addr.c_str());
+});
+
+SerialBT.onConfirmRequest([](uint32_t numVal) {
+    Serial.printf("\n");
+    Serial.printf("[BT] =========================================\n");
+    Serial.printf("[BT] PAIRING REQUEST from new device\n");
+    Serial.printf("[BT] Numeric comparison code: %06lu\n", (unsigned long)numVal);
+    Serial.printf("[BT] Press the BOOT button (GPIO0) to CONFIRM\n");
+    Serial.printf("[BT] Or wait 30s to auto-reject\n");
+    Serial.printf("[BT] =========================================\n");
+    // Signal the button-wait task
+    sspNumVal = numVal;
+    sspPending = true;
+});
+
+SerialBT.onAuthComplete([](bool success) {
+    Serial.printf("[BT] Pairing %s\n", success ? "SUCCESS" : "FAILED");
+    sspPending = false;
+});
+```
+
+Add global state variables before `setup()`:
+
+```cpp
+static volatile bool sspPending = false;
+static volatile uint32_t sspNumVal = 0;
+```
+
+### 2. Boot Button Task (`taskBootButton`)
+
+Create a second FreeRTOS task pinned to Core 1 that polls GPIO0:
+
+```cpp
+#define BOOT_BUTTON_GPIO  0   // GPIO0 = BOOT button on ESP32-CAM
+
+void taskBootButton(void* parameter) {
+  (void)parameter;
+
+  pinMode(BOOT_BUTTON_GPIO, INPUT_PULLUP);
+
+  while (true) {
+    if (sspPending) {
+      // Wait up to 30 seconds for button press
+      unsigned long start = millis();
+      while (sspPending && (millis() - start < 30000)) {
+        if (digitalRead(BOOT_BUTTON_GPIO) == LOW) {
+          // Debounce
+          delay(50);
+          if (digitalRead(BOOT_BUTTON_GPIO) == LOW) {
+            Serial.printf("[BT] BOOT button pressed — confirming pairing\n");
+            SerialBT.confirmReply(true);
+            sspPending = false;
+            break;
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+
+      if (sspPending) {
+        // Timeout — reject
+        Serial.printf("[BT] Pairing timeout — rejecting\n");
+        SerialBT.confirmReply(false);
+        sspPending = false;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+```
+
+Spawn it in `setup()`:
+
+```cpp
+  xTaskCreatePinnedToCore(
+    taskBootButton,
+    "bootbtn",
+    2048,
+    NULL,
+    1,
+    NULL,
+    1    // Core 1
+  );
+```
+
+### 3. Remove Legacy `setPin()` / `enableSSP()` Calls
+
+In `setup()`, delete or comment out:
+
+```cpp
+  // REMOVE THESE — legacy PIN does not work with modern OS SSP:
+  // SerialBT.enableSSP(false, false);
+  // SerialBT.setPin(pin.c_str(), pin.length());
+```
+
+Keep the PIN file read logic if you want to re-purpose it later (e.g., as an application-level password), but it no longer affects Bluetooth pairing.
+
+### 4. Keep `btpin.txt` as App-Level Password (Optional)
+
+If you still want a password, implement it at the **application protocol layer** instead of the Bluetooth link layer:
+
+- On first Bluetooth connection, require the client to send `AUTH <pin>` before any other command is accepted.
+- Read the expected PIN from `/btpin.txt`.
+- Reject all commands with `[ERROR] Not authenticated` until `AUTH` succeeds.
+- This is independent of Bluetooth pairing and works on all OSes.
+
+---
+
+## Alternative: Auto-Confirm (Development Only)
+
+For rapid development without pressing a button every time, auto-accept SSP:
+
+```cpp
+SerialBT.onConfirmRequest([](uint32_t numVal) {
+    Serial.printf("[BT] Auto-confirming pairing code %06lu\n", (unsigned long)numVal);
+    SerialBT.confirmReply(true);
+});
+```
+
+**⚠️ Security warning:** This allows any device to pair without user confirmation. Only use this on a trusted test bench.
+
+---
+
+## ESP32-CAM Pin Reference
+
+| Pin | Function | Pairing Role |
+|-----|----------|--------------|
+| GPIO0 | BOOT button | Physical confirmation press |
+| GPIO1 | U0TXD | Serial debug output (wired USB) |
+| GPIO3 | U0RXD | Serial debug input (wired USB) |
+
+Wiring: GPIO0 has an internal pull-up. Pressing BOOT shorts it to GND. No external resistor needed.
+
+---
+
+## Full Debug Output Example (Wired Serial)
+
+```
+[INFO] SD mounted in 4-bit mode.
+[INFO] Bluetooth 'ESP32-FTP' ready.
+[BT] =========================================
+[BT] PAIRING REQUEST from new device
+[BT] Numeric comparison code: 482917
+[BT] Press the BOOT button (GPIO0) to CONFIRM
+[BT] Or wait 30s to auto-reject
+[BT] =========================================
+[BT] BOOT button pressed — confirming pairing
+[BT] Pairing SUCCESS
+[BT] Client connected: 00:11:22:33:44:55
+```
+
+---
+
+## Files to Modify
+
+| File | Changes |
+|------|---------|
+| `BluetoothFTPServer.ino` | Add `onConnect`, `onDisconnect`, `onConfirmRequest`, `onAuthComplete` callbacks. Remove `enableSSP()` and `setPin()`. Spawn `taskBootButton` on Core 1. Add `sspPending` / `sspNumVal` globals. |
+| `ftp_commands.cpp` | Optionally add `AUTH` command for app-level PIN. |
+| `ftp_commands.h` | Add `cmdAuth` declaration if implementing app-level auth. |
+
+---
+
+## Test Checklist
+
+- [ ] Flash sketch, open Serial Monitor at 115200 baud
+- [ ] In Ubuntu Bluetooth settings, click "Pair" on "ESP32-FTP"
+- [ ] Verify Serial Monitor shows 6-digit code and "Press BOOT button"
+- [ ] Press BOOT button (GPIO0 to GND)
+- [ ] Verify "Pairing SUCCESS" appears
+- [ ] Verify Ubuntu shows "Connected"
+- [ ] Open Serial Bluetooth Terminal, send `HELP`, verify response
+- [ ] Disconnect Bluetooth, reconnect — verify no re-pairing needed
+- [ ] (Optional) Try without pressing button — verify timeout rejection

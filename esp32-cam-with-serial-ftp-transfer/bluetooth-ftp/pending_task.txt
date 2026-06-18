@@ -1,0 +1,1 @@
+since the buffer size is asymmetric, implement a similar ack transmit protocol with larger chunk size in cmdRead, if possible, or reuse the chunk setting from cmdWrite?

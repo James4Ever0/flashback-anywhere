@@ -1,0 +1,160 @@
+# Refactor Plan: configurable_timelapse_sketch -> refactored_configurable_timelapse_sketch
+
+## Goal
+Split the monolithic single-file .ino into a modular multi-file Arduino project with clear separation of concerns. The main photo capture pipeline must accept an externally-initialized SD card (fs::FS&) so storage is injected, not hard-wired.
+
+## File Structure
+
+```
+refactored_configurable_timelapse_sketch/
+├── refactored_configurable_timelapse_sketch.ino   // setup(), loop(), high-level orchestration
+├── pins.h                                         // All AI-Thinker pin defines + LED pin
+├── app_config.h / app_config.cpp                  // Config struct, defaults, load/save (needs fs::FS&)
+├── camera_manager.h / camera_manager.cpp          // Camera init, warm-up, frame capture
+├── storage_manager.h / storage_manager.cpp        // SD_MMC init wrapper, file I/O helpers
+└── photo_pipeline.h / photo_pipeline.cpp          // Orchestrates: capture -> store -> config update -> sleep
+```
+
+## Module Breakdown
+
+### 1. pins.h
+- All `#define` pin constants (PWDN_GPIO_NUM through PCLK_GPIO_NUM)
+- FLASH_LED_PIN
+- No .cpp needed
+
+### 2. app_config.h / app_config.cpp
+**app_config.h:**
+- `struct Config` with intervalSec, jpegQuality, frameSize, pictureNumber
+- Default constants: DEFAULT_INTERVAL_SEC, DEFAULT_JPEG_QUALITY, DEFAULT_FRAME_SIZE, DEFAULT_PICTURE_NUMBER
+- `extern Config g_config;` (global instance)
+- `bool loadConfig(fs::FS& fs, Config& outConfig);`
+- `bool writeConfig(fs::FS& fs, const Config& config);`
+- `String frameSizeToString(uint16_t fs);`
+- `uint16_t stringToFrameSize(const String& s);`
+
+**app_config.cpp:**
+- Implements config parsing/writing.
+- `loadConfig()` reads from `/config.txt` on the passed `fs::FS&`, populates defaults if missing.
+- `writeConfig()` writes the struct back to `/config.txt` with comments.
+- Uses the passed filesystem reference for ALL file operations (no direct SD_MMC calls).
+
+### 3. camera_manager.h / camera_manager.cpp
+**camera_manager.h:**
+- `bool initCamera(const Config& config);` — sets up camera using config values, PSRAM-aware fallback
+- `camera_fb_t* captureImageBuffer(int warmUpFrames = 10, int warmUpDelayMs = 50);`
+  - Performs warm-up frames, returns the captured frame buffer.
+  - Caller is responsible for calling `esp_camera_fb_return()`.
+- `void releaseImageBuffer(camera_fb_t* fb);` — thin wrapper around `esp_camera_fb_return()`
+
+**camera_manager.cpp:**
+- `initCamera()` moved from original, uses `config.jpegQuality` and `config.frameSize`.
+- All sensor tuning (brightness, contrast, mirror, flip, etc.) stays here.
+- `captureImageBuffer()` extracts the warm-up loop + `esp_camera_fb_get()`.
+
+### 4. storage_manager.h / storage_manager.cpp
+**storage_manager.h:**
+- `bool initSD();` — mounts SD_MMC, prints card size, returns true/false
+- `bool writeFile(fs::FS& fs, const char* path, const uint8_t* data, size_t len);`
+- `bool fileExists(fs::FS& fs, const char* path);`
+
+**storage_manager.cpp:**
+- `initSD()` wraps the original SD_MMC mount logic.
+- `writeFile()` opens path on the given fs::FS&, writes data, closes.
+- Pure I/O helpers; no business logic about filenames or config.
+
+### 5. photo_pipeline.h / photo_pipeline.cpp
+**photo_pipeline.h:**
+- `void runPhotoCycle(fs::FS& storage, Config& config);`
+  - The main orchestrator that replaces `takePhotoAndSleep()`.
+  - Decomposed into discrete steps so each is independently callable/testable.
+
+**photo_pipeline.cpp:**
+Orchestration steps (each becomes its own function):
+
+```cpp
+// Function A: capture image from camera
+bool captureImage(camera_fb_t** outFb);
+
+// Function B: store image to filesystem
+bool storeImage(fs::FS& fs, const String& path, camera_fb_t* fb);
+
+// Function C: update config with new picture number on filesystem
+bool persistConfig(fs::FS& fs, Config& config);
+
+// Function D: manage flash LED state
+void setFlash(bool on);
+
+// Function E: enter deep sleep
+void enterDeepSleep(uint32_t seconds);
+```
+
+`runPhotoCycle()` flow:
+1. `setFlash(true)` + `rtc_gpio_hold_en(GPIO_NUM_33)`
+2. `captureImage(&fb)` — warm-up + get frame buffer
+3. If capture failed: log error, `enterDeepSleep(5)` (retry after 5s)
+4. `config.pictureNumber++`
+5. Build filename: `String path = "/picture" + String(config.pictureNumber) + ".jpg"`
+6. `storeImage(storage, path, fb)` — write to the externally provided fs::FS&
+7. `persistConfig(storage, config)` — write updated picture number back to config.txt
+8. `releaseImageBuffer(fb)`
+9. `setFlash(false)` + `rtc_gpio_hold_dis(GPIO_NUM_33)`
+10. `enterDeepSleep(config.intervalSec)`
+
+Key design point: `fs::FS& storage` is injected into `runPhotoCycle()`. The pipeline does NOT call `SD_MMC` directly for file writes; it uses the passed reference. This allows:
+- Testing with a mock filesystem
+- Future switch to SPIFFS/LittleFS without touching pipeline code
+- Clear dependency graph
+
+## Main Sketch (.ino)
+
+```cpp
+#include "pins.h"
+#include "app_config.h"
+#include "camera_manager.h"
+#include "storage_manager.h"
+#include "photo_pipeline.h"
+
+Config g_config;
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  if (!initSD()) { Serial.println("[FATAL] SD init failed. Halting."); return; }
+
+  // SD is initialized; pass it into config loader
+  loadConfig(SD_MMC, g_config);
+
+  if (!initCamera(g_config)) { Serial.println("[FATAL] Camera init failed. Halting."); return; }
+
+  // Pass SD_MMC as the storage reference into the pipeline
+  runPhotoCycle(SD_MMC, g_config);
+}
+
+void loop() {}
+```
+
+## Dependency Graph
+
+```
+.ino  ->  pins.h
+       ->  app_config.h
+       ->  camera_manager.h
+       ->  storage_manager.h
+       ->  photo_pipeline.h
+
+app_config.cpp  ->  app_config.h (uses fs::FS&)
+camera_manager.cpp  ->  camera_manager.h, app_config.h
+storage_manager.cpp ->  storage_manager.h
+photo_pipeline.cpp  ->  photo_pipeline.h, camera_manager.h, app_config.h, storage_manager.h, pins.h
+```
+
+## Notes
+- `photo_pipeline.cpp` includes `pins.h` only for FLASH_LED_PIN and GPIO_NUM_33.
+- All modules use `Serial` for logging; no custom logger needed for this scope.
+- Config struct remains a plain C-style struct for simplicity.
+- `fs::FS&` is the Arduino filesystem base class; `SD_MMC` is the concrete instance.

@@ -1,0 +1,30 @@
+● Yes.
+
+  Identify interface by USB: Parse /sys/class/net/*/device/modalias or use pyudev to
+  map USB vendor/product IDs to interface names (e.g. wlx00c0ca...).
+
+  Connect that interface to WiFi: Use nmcli or NetworkManager D-Bus. Example:
+  nmcli device wifi connect "SSID" password "PASS" ifname wlan1
+
+  Python FTP bound to that interface: ftplib doesn't expose binding directly.
+  Subclass it to set SO_BINDTODEVICE on the socket before connect(), or bind to the
+  interface's IP:
+
+  import socket, ftplib
+
+  class FTPBound(ftplib.FTP):
+      def __init__(self, iface, *args, **kwargs):
+          self.iface = iface
+          super().__init__(*args, **kwargs)
+      def connect(self, host='', port=0, timeout=-999):
+          self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+  self.iface.encode())
+          self.sock.connect((host, port))
+          # ... rest of ftplib connect logic
+
+  SO_BINDTODEVICE requires root. Alternative: bind to the interface's IP instead
+  (self.sock.bind((iface_ip, 0))), which doesn't.
+
+  Alternative libraries: pycurl has pycurl.INTERFACE / pycurl.LOCALPORT. Paramiko
+  (SFTP) also lets you bind source address.

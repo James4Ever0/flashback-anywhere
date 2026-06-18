@@ -1,0 +1,134 @@
+# Fix for AttributeError: 'SerialTransfer' object has no attribute 'txBuff'
+
+## Bug
+
+```
+[lib]   Exception: AttributeError: 'SerialTransfer' object has no attribute 'txBuff'
+```
+
+This happens in `esp32cam_client.py` inside `_send_raw()` at the line:
+
+```python
+self.link.txBuff[0] = pkt_type
+```
+
+## Root Cause
+
+The `pySerialTransfer` Python library has an unstable API across versions. The code was
+written against an assumed API, but your installed version uses different attribute names.
+
+## Exact Version to Install
+
+```bash
+pip install pySerialTransfer==2.1.7
+```
+
+Version **2.1.7** is the last version that exposes `txBuff` and `rxBuff` as plain
+list/bytearray attributes on the `SerialTransfer` object. Later versions (2.2+) rewrote
+the internals and the buffer-access API changed.
+
+> If 2.1.7 does not work, try the even older **1.4.2** which was the most widely
+documented version in tutorials:
+> ```bash
+> pip install pySerialTransfer==1.4.2
+> ```
+
+## Alternative: Check What You Actually Have Installed
+
+Run this in your Python REPL:
+
+```python
+import pySerialTransfer
+print(pySerialTransfer.__file__)   # shows source path
+print(pySerialTransfer.__version__) # may or may not exist
+
+from pySerialTransfer import pySerialTransfer as t
+print([a for a in dir(t.SerialTransfer) if not a.startswith('_')])
+```
+
+Look for attributes like `txBuff`, `tx_buf`, `packet`, `send`, `available`, `bytesRead`.
+
+## How to Fix the Code (Three Scenarios)
+
+### Scenario A: You have pySerialTransfer 2.1.x or older (txBuff/rxBuff exist)
+
+The code should work as-is after installing the correct version:
+
+```bash
+pip install pySerialTransfer==2.1.7
+```
+
+### Scenario B: You have pySerialTransfer 2.6.x (newer rewritten API)
+
+In newer versions the `SerialTransfer` class uses different internals.
+The send/receive pattern changed from raw buffer access to `txObj()`/`rxObj()` helpers.
+
+If you want to keep your newer version, rewrite `_send_raw()` and `_recv_packet()`
+to use the high-level API. Example pattern:
+
+```python
+def _send_raw(self, pkt_type: int, payload: bytes) -> None:
+    self.link.txObj(pkt_type, val_type='byte')
+    for i, b in enumerate(payload):
+        self.link.txObj(b, start_pos=1+i, val_type='byte')
+    self.link.send(1 + len(payload))
+
+def _recv_packet(self, timeout: float = 10.0) -> tuple[int, bytes]:
+    start = time.time()
+    while time.time() - start < timeout:
+        if self.link.available():
+            pkt_type = self.link.rxObj(0, val_type='byte')
+            payload = bytes(self.link.rxBuff[1:self.link.bytesRead])
+            return pkt_type, payload
+        time.sleep(0.005)
+    raise ESP32CamError(f"Packet receive timeout ({timeout}s)")
+```
+
+But this is guesswork — the 2.6.x API docs are sparse. **Downgrading to 2.1.7 is
+strongly recommended.**
+
+### Scenario C: You accidentally installed the wrong package
+
+Check if you have `serialtransfer` (lowercase, wrong package) instead of
+`pySerialTransfer`:
+
+```bash
+pip list | grep -i serial
+```
+
+If you see `serialtransfer` (not `pySerialTransfer`), uninstall it and install
+the correct one:
+
+```bash
+pip uninstall serialtransfer
+pip install pySerialTransfer==2.1.7
+```
+
+## What the Author Should Have Done
+
+The `requirements.txt` should have pinned an exact known-working version instead of
+`>=2.6.9` which assumes an API that may not exist:
+
+```
+# requirements.txt — CORRECTED
+pyserial>=3.5
+pySerialTransfer==2.1.7
+```
+
+## Files to Change
+
+1. `requirements.txt` — pin `pySerialTransfer==2.1.7`
+2. `esp32cam_client.py` — if 2.1.7 still fails, inspect `dir(t.SerialTransfer)`
+   and update `_send_raw()` / `_recv_packet()` to match your installed API.
+
+## Quick Verification After Fix
+
+```python
+from pySerialTransfer import pySerialTransfer as txfer
+link = txfer.SerialTransfer('/dev/ttyUSB0', 115200)
+print(hasattr(link, 'txBuff'))  # should print: True
+print(hasattr(link, 'rxBuff'))  # should print: True
+print(hasattr(link, 'bytesRead'))  # should print: True
+```
+
+If all three print `True`, the code will work.

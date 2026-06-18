@@ -1,0 +1,20 @@
+i have two ino files. one can create a series of photo shots and enter deep sleep mode, one can enter serial command mode for file transfer.
+
+how can i combine these two ino files into one ino file?
+
+conditions related to mode change:
+
+- detect the battery charging status, if the device is charging.
+- some button is pressed.
+- some serial command is received.
+
+things related to photo taking:
+
+- read config from sd card, from initialization.
+- can configure the shot interval
+
+things related to file transfer:
+
+- can store file
+- can read file
+- can delete file

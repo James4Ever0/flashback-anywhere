@@ -1,0 +1,1 @@
+use ffmpeg to convert avi to a series of jpeg images.

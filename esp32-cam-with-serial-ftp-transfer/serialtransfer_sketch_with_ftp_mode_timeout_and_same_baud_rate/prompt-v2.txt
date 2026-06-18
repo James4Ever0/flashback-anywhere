@@ -1,0 +1,15 @@
+read /home/jamesbrown/Desktop/works/flashback-anywhere/esp32-cam-with-serial-ftp-transfer/refactored_configurable_timelapse_sketch/refactored_configurable_timelapse_sketch.ino
+
+use the timelapse sketch here, copy reusable files, and make sure you do not do deepsleep here.
+
+targets:
+
+configure the two modes to use the same baudrate 921600
+
+always listen to the serial input in the board side, which means you listen to MODE TRANSFER command during camera capture. since the camera capture takes time, you can set a larger timeout during first init. another command to get current mode: CURRENT_MODE -> TRANSFER or PHOTO
+
+change the current client side or pc side serial init logic, always use the same baudrate, first get CURRENT_MODE using command, if response not TRANSFER or unknown, issue command MODE TRANSFER and wait at most 10 seconds. display things along the way from the board (received bytes) for debugging. expect some keyword like [OK] mode changed to xxx within the response (containing it will be enough, collect the full buffer along the way, since photo serial output might corrupt the output?) then stop init, otherwise fails.
+
+always drain read buffer from client side before sending next command. but buffer draining is not required during init process (setting mode to TRANSFER). draining logic reference: /home/jamesbrown/Desktop/works/flashback-anywhere/esp32-cam-with-serial-ftp-transfer/bluetooth-ftp/python_client/bt_ftp_client.py, function _drain_stale
+
+if no command issued in TRANSFER mode, on the board side, automatically switch back to PHOTO mode within 30 seconds. this value shall be a macro defined in ino file.

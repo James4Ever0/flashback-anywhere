@@ -1,0 +1,13 @@
+there is an esp32 library or function called serialbt. i want to know if we can use the bluetooth just like a terminal interface.
+
+i want to set a fixed pin code, just like a password, reading from file or set by serial command.
+
+i want to know if we can put the bluetooth ftp process into background, and other processes like taking photos, recording audio into background. will it cause any conflict like reading/writing from the same file? can we use or implement lock?
+
+read things in current directory.
+
+write the code to ./bluetooth-ftp, and the code shall only contain a bluetooth serial server with serial ftp like commands.
+
+write a plan at ./bluetooth-ftp/bluetooth-ftp-plan.txt with libraries and version of python and arduino.
+
+write a plan at ./bluetooth-ftp/background-process-and-io-locks.txt

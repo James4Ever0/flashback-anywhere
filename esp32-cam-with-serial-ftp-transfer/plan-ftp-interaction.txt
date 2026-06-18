@@ -1,0 +1,104 @@
+# Plan: Python Serial FTP Interaction
+
+## Overview
+Create a Python client library + TUI for interacting with the ESP32-CAM CombinedSketch over a serial port.
+
+## Architecture
+
+```
+python-ftp-interaction/
+├── lib_esp32cam.py   # Low-level serial communication library
+└── tui_esp32cam.py   # Interactive TUI / CLI tool
+```
+
+## Connection Protocol (from `info-ftp-interaction.txt`)
+
+1. **Primary attempt**: Open port at 2000000 baud, send `HELP\n`, expect `Available commands:` in response.
+2. **Fallback**: If HELP fails, open at 115200 baud, wait up to 30s for boot text containing `"Send 'MODE TRANSFER' to switch"`, then send `MODE TRANSFER\n`. Reconnect at 2000000 baud.
+3. **Timeout**: If neither works within 30s, exit with error.
+
+## Serial Protocol Details (observed from interaction log)
+
+- **Prompt character**: `>` (with trailing space `> `)
+- **Line endings**: Commands sent with `\n`. Responses use `\n`.
+- **End-of-transmission marker**: ASCII EOT (`0x04`) after READ binary data.
+- **Command case**: Case-insensitive on device; library sends uppercase.
+
+### Command Reference
+
+| Command | Request | Success Response | Error Response |
+|---------|---------|------------------|----------------|
+| LIST | `LIST <path>\n` | `[DIR]  name\n[FILE]  size bytes  name\n` | `[ERROR] ...` |
+| READ | `READ <path>\n` | `SIZE: <size>\n<binary>\x04` | `[ERROR] ...` |
+| DELETE | `DELETE <path>\n` | `[OK] Deleted: <path>` | `[ERROR] ...` |
+| STORE | `STORE <path> <size>\n` then binary | `[OK] File stored: ...` | `[ERROR] ...` |
+| MODE | `MODE PHOTO\n` / `MODE TRANSFER\n` | `[OK] Switching to...` | `[ERROR] ...` |
+| HELP | `HELP\n` | Multi-line help text | — |
+
+## `lib_esp32cam.py` — Library Design
+
+### Class: `ESP32CamSerial`
+
+- `__init__(port, timeout=30)`
+  - Store port path, timeouts.
+- `connect()`
+  - Implements the two-phase connection protocol.
+  - Returns `True` on success, raises `ConnectionError` on failure.
+- `disconnect()`
+  - Close serial port cleanly.
+- `_send_cmd(cmd)` — internal
+  - Write command + `\n`, wait for prompt, return full response text.
+- `_read_until_prompt()` — internal
+  - Read lines until `> ` prompt appears.
+- `list_files(path="/sdcard")` → `list[dict]`
+  - Parse `[DIR]` and `[FILE]` lines into structured dicts.
+  - Return `[{"type": "dir", "name": "..."}, {"type": "file", "name": "...", "size": 123}]`
+- `read_file(path) → bytes`
+  - Send `READ`, parse `SIZE: N`, read exactly N bytes + EOT marker.
+- `delete_file(path) → bool`
+  - Send `DELETE`, check for `[OK]`.
+- `store_file(path, data: bytes) → bool`
+  - Send `STORE <path> <len>\n`, wait for `[OK] Ready to receive`, write data, read response.
+- `switch_mode(mode: "photo" | "transfer")`
+  - Send `MODE <mode>`. If switching to photo, disconnect (device will deep sleep).
+- `repl()`
+  - Pass-through REPL: user types commands, raw responses printed.
+
+## `tui_esp32cam.py` — CLI / TUI Design
+
+### Command-line interface
+
+```
+python tui_esp32cam.py /dev/ttyACM0 [command] [args...]
+```
+
+### Subcommands
+
+| Subcommand | Args | Description |
+|------------|------|-------------|
+| `repl` | — | Interactive REPL with the device |
+| `list` | `[path]` | List files (default: `/sdcard`) |
+| `delete` | `<filename>` | Delete a file |
+| `upload` | `<src> <dst>` | Upload local file to device |
+| `download` | `<src> <dst>` | Download file from device to local |
+
+### Interactive REPL behavior
+
+- Print `Connected to <port> at <baud>` on start.
+- Show `esp32> ` prompt.
+- User types command, library sends it, response printed.
+- Special commands:
+  - `!quit` / `!exit` — disconnect and exit
+  - `!list [path]` — parsed list output
+  - `!upload <src> <dst>` — upload file
+  - `!download <src> <dst>` — download file
+
+## Error Handling
+
+- Serial timeout → `TimeoutError`
+- Device error response → `ESP32CamError` (custom exception)
+- Port not found → `FileNotFoundError` / `serial.SerialException`
+
+## Dependencies
+
+- `pyserial` (`pip install pyserial`)

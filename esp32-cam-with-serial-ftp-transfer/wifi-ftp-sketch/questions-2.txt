@@ -1,0 +1,5 @@
+still wifi ap name and password are not working. cannot set them
+
+also the files transfered from ftp are broken. they have different crc value
+
+try to use http server instead of ftp?

@@ -1,0 +1,1 @@
+use external physical switch for mode select

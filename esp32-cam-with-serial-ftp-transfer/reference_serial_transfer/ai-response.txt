@@ -1,0 +1,23 @@
+
+● Use XMODEM — it's the standard protocol for serial file transfer, been in use for
+  40+ years, and has mature libraries on both sides.
+
+  - Arduino: XModem library (available in Library Manager)
+  - Python: xmodem package (pip install xmodem)
+
+  XMODEM sends data in fixed 128-byte or 1K blocks, each with a sequence number and
+  checksum/CRC. The receiver ACKs each block; if a block is corrupt or missing, the
+  sender retransmits. No custom framing needed.
+
+  If you want something more modern with less overhead, SerialTransfer (PowerBroker2)
+   is the de-facto standard for Arduino↔PC binary communication:
+
+  - Arduino: SerialTransfer library
+  - Python: pySerialTransfer package
+
+  It uses COBS framing + CRC16 and handles variable-length packets. The API is
+  txObj()/rxObj() on the Arduino side and similar on Python. Much faster than XMODEM
+  but not as universally recognized.
+
+  For your use case (file transfer, slow is OK, wants standard libraries), XMODEM is 
+  the right choice.

@@ -1,0 +1,283 @@
+# Background Processes & I/O Lock Plan
+
+## The Core Question
+
+Can the Bluetooth FTP server run "in the background" while photo capture and audio recording also run concurrently? What conflicts arise from multiple tasks reading/writing the same SD card? How do we prevent corruption?
+
+---
+
+## 1. What "Background" Means on ESP32
+
+The ESP32 has **two Xtensa LX6 cores** (PRO_CPU / APP_CPU). FreeRTOS (bundled in the Arduino core) schedules tasks across both cores. "Background" in this context means:
+
+- **Task A (Bluetooth FTP)**: A FreeRTOS task that listens for BT commands, parses them, and executes file operations.
+- **Task B (Photo Capture)**: A FreeRTOS task (or timer callback) that triggers camera capture and writes JPEG to SD.
+- **Task C (Audio Record)**: A FreeRTOS task that reads from I2S microphone and writes PCM/WAV to SD.
+
+All three share:
+- **SD_MMC bus** (1-bit or 4-bit) — single physical channel
+- **Filesystem** (FAT32 on SD) — single logical volume
+- **Heap / SPIRAM** — if camera frame buffer and audio buffer coexist
+
+---
+
+## 2. Concurrency Conflicts
+
+### 2.1 SD Card Bus Contention
+
+The ESP32's SD_MMC host driver is **not inherently thread-safe** at the Arduino `FS.h` / `SD_MMC.h` layer. Multiple tasks calling `SD_MMC.open()`, `file.write()`, `file.read()` simultaneously will:
+
+- **Corrupt files**: Interleaved writes from two tasks produce garbage.
+- **Corrupt filesystem**: FAT tables updated inconsistently can destroy the whole card.
+- **Hard crash**: The SD_MMC driver may panic on concurrent SPI bus access.
+
+**Verdict:** A **mutex (lock)** is required around ALL SD card operations.
+
+### 2.2 Specific Conflict Scenarios
+
+| Scenario                              | Risk Level | Description                                          |
+|---------------------------------------|------------|------------------------------------------------------|
+| FTP READ during Photo WRITE           | **HIGH**   | Photo task opens `/DCIM/picture42.jpg` for write; FTP task opens same file for read. Read may see partial/corrupt JPEG. |
+| FTP LIST during Photo WRITE           | **MEDIUM** | LIST iterates directory entries; new file creation may be invisible or directory metadata may be inconsistent. |
+| Audio WRITE during FTP STORE          | **HIGH**   | Two writers = interleaved bytes = both files destroyed. |
+| Photo WRITE during Audio WRITE (different files) | **MEDIUM** | FAT table updates for two files can collide without proper filesystem locking. |
+| FTP DELETE during any WRITE to same file | **HIGH**   | Writer holds open handle; deleter removes directory entry. FAT cluster chain orphaned or reused while writer still appending. |
+
+### 2.3 SPIRAM / Heap Contention
+
+The camera driver (`esp_camera`) allocates a large DMA-capable buffer (~200–500KB) from SPIRAM or heap. Audio recording also needs buffers. If both tasks run simultaneously:
+
+- **SPIRAM exhaustion** → `malloc` fails → camera init fails or audio drops frames.
+- **DMA buffer fragmentation** → camera capture delayed or corrupted.
+
+**Verdict:** Buffer sizes and lifetimes must be managed. Prefer allocating camera buffer once at boot, and use smaller ring buffers for audio.
+
+---
+
+## 3. Synchronization Strategy: The SD Lock Mutex
+
+### 3.1 FreeRTOS Mutex in Arduino
+
+Arduino-ESP32 wraps FreeRTOS. Use `SemaphoreHandle_t` or the C++ wrapper `std::mutex` (if enabled) or simply use FreeRTOS directly:
+
+```cpp
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+static SemaphoreHandle_t sdMutex = NULL;
+
+void setup() {
+    sdMutex = xSemaphoreCreateMutex();
+}
+```
+
+### 3.2 Locking Pattern
+
+Every function that touches the SD card must acquire the mutex:
+
+```cpp
+bool listDirectory(const char* path) {
+    if (xSemaphoreTake(sdMutex, portMAX_DELAY) != pdTRUE) {
+        return false;  // should never happen with portMAX_DELAY
+    }
+
+    File root = SD_MMC.open(path);
+    // ... iterate, print ...
+    root.close();
+
+    xSemaphoreGive(sdMutex);
+    return true;
+}
+```
+
+### 3.3 Critical Section Rules
+
+| Rule                                      | Rationale                                           |
+|-------------------------------------------|-----------------------------------------------------|
+| **Always use `portMAX_DELAY`**            | FTP commands are user-triggered; blocking is OK.    |
+| **Never hold the mutex during sleep**     | `esp_deep_sleep_start()` with a held mutex = deadlock on wake. |
+| **Never hold the mutex during BT I/O**    | Streaming a large file over Bluetooth while holding the lock blocks photo/audio for the entire transfer. |
+| **Keep critical sections short**          | Open → read/write chunk → close → give. Do NOT read the whole file in one critical section if it's large. |
+| **Chunked READ with interleaved yield**   | Read 1KB from SD, give mutex, send over BT, retake mutex, repeat. |
+
+### 3.4 Lock Hierarchy (avoid deadlock)
+
+If multiple locks are needed (e.g., camera buffer lock + SD lock), always acquire in the same order:
+
+```
+Order: cameraLock -> sdMutex
+Never acquire sdMutex then cameraLock.
+```
+
+---
+
+## 4. Designing Background Tasks
+
+### 4.1 Task Layout
+
+```
+Core 0 (PRO_CPU):  [Bluetooth FTP Task]  — priority 1
+                     [Idle Task]
+
+Core 1 (APP_CPU):  [Photo Capture Task]  — priority 2 (higher)
+                     [Audio Record Task] — priority 2 (same, but mutex-guarded)
+                     [Idle Task]
+```
+
+**Rationale:** Bluetooth I/O is latency-tolerant; photo capture should not drop frames. Core 1 handles the heavier real-time work. Core 0 handles the slower human-interactive protocol.
+
+### 4.2 Photo Capture Task (Background)
+
+Instead of `setup()` → `loop()` → deep sleep, run a FreeRTOS task:
+
+```cpp
+void taskPhotoCapture(void* parameter) {
+    while (true) {
+        vTaskDelay(intervalMs / portTICK_PERIOD_MS);
+
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        // capture frame
+        // write to SD
+        // close file
+        xSemaphoreGive(sdMutex);
+    }
+}
+```
+
+**Deep sleep complication:** If the device is supposed to deep sleep between photos, you cannot have a persistent background task. Options:
+
+| Approach | Description | Trade-off |
+|----------|-------------|-----------|
+| **A: Stay awake, tasks run** | No deep sleep. Photo task triggers on timer. BT task always on. | High power consumption (~100–200mA). Simplest. |
+| **B: Sleep + wake** | Deep sleep between photos. On wake, restart BT task. | BT client disconnects every sleep cycle. Power efficient. |
+| **C: Sleep until trigger** | Light sleep (`esp_light_sleep_start()`) keeps BT radio on. | BT stays connected. Less power savings than deep sleep. |
+
+**Recommended:** Approach A for development/debugging; Approach C for production if BT connectivity must be maintained.
+
+### 4.3 Audio Recording Task (Background)
+
+Audio recording is continuous. It must:
+- Run at a fixed sample rate (e.g., 16 kHz)
+- Write to SD in chunks (ring buffer → SD flush)
+- Cooperate with the SD mutex
+
+```cpp
+void taskAudioRecord(void* parameter) {
+    while (true) {
+        // Read I2S microphone into local buffer (DMA, fast)
+        i2s_read(I2S_NUM_0, localBuf, CHUNK_SIZE, &bytesRead, portMAX_DELAY);
+
+        // Only lock SD for the write, not for the I2S read
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        wavFile.write(localBuf, bytesRead);
+        xSemaphoreGive(sdMutex);
+    }
+}
+```
+
+---
+
+## 5. Coordination Between FTP and Background Tasks
+
+### 5.1 Command Quiescence
+
+Some FTP commands require that background tasks pause:
+
+| FTP Command | Requires Background Pause? | Mechanism |
+|-------------|---------------------------|-----------|
+| `LIST`      | No                        | SD mutex is sufficient. |
+| `READ`      | No                        | SD mutex + chunked yield. |
+| `STORE`     | No                        | SD mutex + chunked yield. |
+| `DELETE`    | **Yes**                   | If deleting a file currently being written to by photo/audio. |
+| `FORMAT`    | **Yes — everything**      | Must stop photo + audio tasks, format, restart. |
+| `MODE PHOTO`| **Yes — FTP**             | Stop BT task, start photo task. |
+| `MODE TRANSFER`| **Yes — photo**        | Stop photo task, start BT task. |
+
+### 5.2 Task Pause / Resume Mechanism
+
+Use an additional `EventGroup` or `TaskNotify` to signal background tasks:
+
+```cpp
+static EventGroupHandle_t systemEvents;
+#define EVT_PHOTO_RUN   (1 << 0)
+#define EVT_AUDIO_RUN   (1 << 1)
+#define EVT_FTP_RUN     (1 << 2)
+
+// Photo task checks:
+EventBits_t bits = xEventGroupWaitBits(systemEvents, EVT_PHOTO_RUN, pdFALSE, pdTRUE, 0);
+if (bits & EVT_PHOTO_RUN) {
+    // proceed with capture
+} else {
+    // skip this cycle, yield CPU
+}
+```
+
+Or use `vTaskSuspend()` / `vTaskResume()` for coarse-grained control:
+
+```cpp
+void enterTransferMode() {
+    vTaskSuspend(photoTaskHandle);
+    vTaskResume(ftpTaskHandle);
+}
+```
+
+**Caution:** Never suspend a task that holds the SD mutex. Always give the mutex first.
+
+---
+
+## 6. File-Level Locking (Optional Enhancement)
+
+A single global SD mutex is sufficient for most cases. However, for finer granularity, implement a **file lock table**:
+
+```cpp
+struct FileLock {
+    char path[64];
+    TaskHandle_t owner;
+    bool writing;
+};
+
+static FileLock openLocks[MAX_OPEN_FILES];
+```
+
+Before any `SD_MMC.open(path, mode)`, check if the file is already locked by another task. This prevents:
+- Deleting a file being written to.
+- Reading a file being written to (return "busy" error instead of corrupt data).
+
+**Trade-off:** More code, more RAM, more deadlock risk. Global mutex is the 80% solution.
+
+---
+
+## 7. Summary: Recommended Implementation
+
+| Concern | Solution |
+|---------|----------|
+| **SD corruption** | One global `SemaphoreHandle_t sdMutex`. Every `open/read/write/close` wrapped. |
+| **BT transfer blocking photo** | Chunked reads/writes: take mutex → read 1KB → give mutex → send over BT → repeat. |
+| **Task priority** | Photo/Audio = priority 2 on Core 1. BT FTP = priority 1 on Core 0. |
+| **Deep sleep vs. always-on** | Use light sleep (`esp_light_sleep_start()`) to keep BT connected while saving power. |
+| **Mode switching** | Suspend/resume tasks. Never suspend while holding `sdMutex`. |
+| **Buffer exhaustion** | Pre-allocate camera framebuffer at boot. Use small I2S ring buffer for audio. |
+| **File busy states** | Global mutex covers it. Add file-level locks only if needed later. |
+
+---
+
+## 8. Code Skeleton (No Implementation)
+
+```
+// In setup():
+//   1. Create sdMutex
+//   2. Create systemEvents (EventGroup)
+//   3. xTaskCreatePinnedToCore(taskBluetoothFTP, ..., 0)
+//   4. xTaskCreatePinnedToCore(taskPhotoCapture, ..., 1)
+//   5. xTaskCreatePinnedToCore(taskAudioRecord, ..., 1)
+
+// In each SD-touching function:
+//   xSemaphoreTake(sdMutex, portMAX_DELAY)
+//   ... do FS work ...
+//   xSemaphoreGive(sdMutex)
+
+// In mode switch:
+//   xSemaphoreTake(sdMutex, portMAX_DELAY)   // ensure quiescence
+//   ... switch tasks ...
+//   xSemaphoreGive(sdMutex)
+```

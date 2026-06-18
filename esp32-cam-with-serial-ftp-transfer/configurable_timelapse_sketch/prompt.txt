@@ -1,0 +1,6 @@
+read ../CombinedSketch 
+read ../reference-ino-files/esp32cam-cam-aithinker-sketch.ino
+
+only add config file read from sd card. create a default config file with default value if not found. just a config read and cam timelapse capture. nothing else. 
+
+write ino sketch file to here.

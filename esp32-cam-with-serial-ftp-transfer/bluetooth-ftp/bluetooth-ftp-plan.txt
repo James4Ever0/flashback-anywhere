@@ -1,0 +1,213 @@
+# Bluetooth Serial FTP Plan
+
+## Goal
+Create a Bluetooth Classic SPP (Serial Port Profile) server on ESP32 that exposes the same FTP-like command interface currently used over wired USB Serial. This enables wireless file management, configuration, and mode switching from a phone or laptop without a USB cable.
+
+---
+
+## Architecture Overview
+
+```
++------------------+     Bluetooth SPP      +------------------+
+|  Phone / Laptop  |  <===================> |  ESP32-CAM       |
+|  (Serial BT app) |     PIN-protected      |  BluetoothSerial |
+|  or Python client|                        |  Server          |
++------------------+                        +--------+---------+
+                                                     |
+                                            +--------v---------+
+                                            |  Command Parser  |
+                                            |  (same as serial)|
+                                            +--------+---------+
+                                                     |
+                              +----------------------+----------------------+
+                              |                      |                      |
+                        +-----v------+        +------v------+       +------v------+
+                        |  SD Card   |        |  Camera     |       |  Audio      |
+                        |  LIST/READ |        |  Capture    |       |  Record     |
+                        |  STORE/DEL |        |             |       |             |
+                        +------------+        +-------------+       +-------------+
+```
+
+---
+
+## Arduino (ESP32) Side
+
+### Core Library: BluetoothSerial
+
+| Item              | Value                                          |
+|-------------------|------------------------------------------------|
+| Library Name      | `BluetoothSerial`                              |
+| Source            | Built into ESP32 Arduino Core                  |
+| Header            | `#include "BluetoothSerial.h"`                 |
+| Protocol          | Bluetooth Classic SPP (Serial Port Profile)    |
+| ESP32 Arduino Core| >= 2.0.14 (tested with 2.0.17, 3.x compatible) |
+
+**Note:** BluetoothSerial uses Classic Bluetooth (BR/EDR), not BLE. The ESP32-CAM module (AI-Thinker) supports this natively. BLE is not suitable here because it lacks a simple streaming serial abstraction and has small MTU limits.
+
+### Key BluetoothSerial APIs
+
+```cpp
+BluetoothSerial SerialBT;
+
+// Startup
+SerialBT.begin("ESP32-CAM-FTP");           // Device name visible during pairing
+SerialBT.setPin("1234");                    // Fixed PIN (pre-2.0.17 style)
+SerialBT.enableSSP(false);                  // Disable Secure Simple Pairing
+SerialBT.setPin(pinCode);                   // Set fixed PIN for legacy pairing
+
+// I/O (same interface as HardwareSerial)
+SerialBT.available();
+SerialBT.read();
+SerialBT.write(buf, len);
+SerialBT.println("...");
+
+// Connection state
+SerialBT.hasClient();                       // True if a device is connected
+SerialBT.disconnect();                      // Drop current client
+SerialBT.end();                             // Stop Bluetooth completely
+```
+
+**PIN Code Configuration Strategy:**
+
+The prompt asks for a fixed PIN, configurable either:
+1. **From file**: Read `/btpin.txt` from SD card at boot. Format: plain text, 4-digit PIN.
+2. **From serial command**: A `SETPIN <pin>` command issued over the *wired* Serial port (or Bluetooth) that writes the new PIN to SD and applies it after reboot.
+
+Because `BluetoothSerial.setPin()` must be called before `begin()`, and changing it at runtime requires an `end()` + `begin()` cycle, the flow is:
+
+```
+boot:
+  read /btpin.txt -> pinCode (fallback to default "0000")
+  SerialBT.setPin(pinCode)
+  SerialBT.begin("ESP32-CAM-FTP")
+
+command SETPIN <newpin>:
+  write <newpin> to /btpin.txt
+  respond "[OK] PIN updated. Reboot to apply."
+  // Do NOT end()/begin() here — it drops the client mid-command.
+```
+
+### Bluetooth vs. Wired Serial — Differences
+
+| Aspect              | Wired Serial (USB-UART)        | Bluetooth Serial (SPP)        |
+|---------------------|--------------------------------|-------------------------------|
+| Baud rate           | Fixed (2M or 115200)           | Not applicable (RFCOMM)       |
+| Buffer sizes        | `setRxBufferSize()` / `setTxBufferSize()` | Internal BT stack buffers (~1KB RFCOMM) |
+| Binary streaming    | Raw bytes, no framing          | Same — transparent byte pipe  |
+| Connection state    | Always on when USB plugged     | `hasClient()` check required  |
+| Latency             | ~1 ms                          | ~20–50 ms                     |
+| Throughput          | ~2 Mbps                        | ~1–1.5 Mbps practical         |
+| Power consumption   | Negligible (passive)           | ~30–50 mA active radio        |
+
+**Implications for FTP protocol:**
+- The same text command + binary payload protocol works unchanged.
+- Chunk size for `READ`/`STORE` may need to be smaller than 16KB to avoid overflowing Bluetooth stack buffers. Suggest 1KB–4KB chunks with per-chunk acknowledgment.
+- No baud rate negotiation needed — the serial abstraction is virtual.
+
+### Bluetooth-Specific FTP Commands
+
+In addition to the existing wired-serial command set, add:
+
+| Command      | Description                              |
+|--------------|------------------------------------------|
+| `SETPIN <p>` | Write new PIN to SD, notify reboot need  |
+| `BTINFO`     | Show BT device name, MAC, PIN, client    |
+| `BTDISCONNECT` | Force-disconnect current BT client     |
+
+### Required Arduino Libraries & Versions
+
+| Library           | Version       | Source                              | Purpose                  |
+|-------------------|---------------|-------------------------------------|--------------------------|
+| ESP32 Arduino Core| >= 2.0.14     | Board Manager URL                   | Core platform + BT stack |
+| BluetoothSerial   | built-in      | ESP32 core                          | BT Classic SPP server    |
+| FS / SD_MMC       | built-in      | ESP32 core                          | SD card filesystem       |
+| esp_camera        | built-in      | ESP32 core                          | OV2640 camera driver     |
+
+**Board settings (AI-Thinker ESP32-CAM):**
+- Board: "AI Thinker ESP32-CAM"
+- Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)" or similar
+- Upload Speed: 921600
+- CPU Frequency: 240 MHz
+
+---
+
+## Python Client Side
+
+### Communication Approach
+
+Python does **not** need `pyserial` for Bluetooth. Instead, use either:
+
+**Option A: `bleak` + custom RFCOMM wrapper** — NOT recommended. bleak is BLE-only and RFCOMM on Linux/Windows/macOS is messy.
+
+**Option B: `pyserial` with a Bluetooth RFCOMM port** — Works on Linux/Windows if the ESP32 is paired as a standard serial port (e.g., `/dev/rfcomm0`). Requires manual `rfcomm bind` on Linux.
+
+**Option C: `pybluez`** — Native Bluetooth socket library. Most flexible, but requires platform-specific setup and is less maintained.
+
+**Recommended Option D: Cross-platform serial bridge**
+- On the host OS, pair the ESP32 once using system Bluetooth settings.
+- The OS exposes it as a virtual serial port:
+  - Linux: `/dev/rfcomm0` (after `sudo rfcomm bind 0 <MAC>`)
+  - macOS: `/dev/tty.ESP32-CAM-FTP` (appears automatically after pairing)
+  - Windows: COM port (appears in Device Manager after pairing)
+- Then use the **same** `lib_esp32cam.py` / `tui_esp32cam.py` client, just pointing at the Bluetooth serial port instead of USB.
+
+### Required Python Libraries & Versions
+
+| Library    | Version   | Install Command              | Purpose                          |
+|------------|-----------|------------------------------|----------------------------------|
+| Python     | >= 3.8    | system package               | Runtime                          |
+| pyserial   | >= 3.5    | `pip install pyserial>=3.5`  | Serial communication (over BT)   |
+| pybluez    | >= 0.23   | `pip install pybluez>=0.23`  | Optional: direct BT socket scan  |
+
+**No new Python dependencies are strictly required** if the OS handles Bluetooth pairing and exposes a virtual serial port. The existing `lib_esp32cam.py` works as-is.
+
+### Python Bluetooth Discovery Helper (optional)
+
+A small standalone script to discover and pair the ESP32:
+
+```
+python bt_discover.py
+```
+- Scans for Bluetooth devices named `ESP32-CAM-FTP`
+- Shows MAC address
+- Prints the OS-specific command to bind a virtual serial port
+
+---
+
+## File Structure
+
+```
+bluetooth-ftp/
+├── bluetooth-ftp-plan.txt          # This file
+├── background-process-and-io-locks.txt
+├── BluetoothFTPServer.ino          # Main Arduino sketch (to be written)
+├── config.h                        # Pins, defaults, buffer sizes
+├── bt_manager.cpp / .h             # BluetoothSerial init, PIN, state
+├── ftp_protocol.cpp / .h           # Shared command parser (BT + Serial)
+├── sd_commands.cpp / .h            # LIST, READ, STORE, DELETE handlers
+├── python_client/                  # Optional Python helper scripts
+│   ├── bt_discover.py              # Scan + pair helper
+│   └── bt_serial_bridge.md         # OS-specific binding instructions
+└── README.md                       # Pairing instructions + protocol spec
+```
+
+---
+
+## Security Notes
+
+1. **PIN is not encryption.** Bluetooth Classic SPP with a 4-digit PIN uses legacy pairing. It prevents casual connection but is not cryptographically strong.
+2. **MAC address filtering:** Consider maintaining an allowlist of paired MAC addresses in `/btallow.txt` for an extra layer.
+3. **Range:** Bluetooth Classic range is ~10 m (class 2). Physical proximity is the primary access control.
+4. **Disable BT in photo mode:** If the device is meant to sleep in photo mode, `SerialBT.end()` before `esp_deep_sleep_start()` to save power.
+
+---
+
+## Pairing Workflow (End User)
+
+1. Power on ESP32-CAM.
+2. Open phone/laptop Bluetooth settings.
+3. Find "ESP32-CAM-FTP" in discoverable devices.
+4. Enter PIN when prompted (default: from `/btpin.txt` or factory default).
+5. Device appears as a paired serial port.
+6. Open serial terminal app (e.g., "Serial Bluetooth Terminal" on Android, or `tui_esp32cam.py` on laptop).
+7. Send `HELP` to verify.

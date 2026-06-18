@@ -1,0 +1,2 @@
+the serial transfer is not good. the checksum mechanism is missing. bytes are always lost.
+fix this in both directions. set a mutual byte chunk size of 2048 bytes. always perform a checksum after each chunk. send checksum before data send. send ACKCHECKSUM after received checksum from client. send ACKDATA after received data from client. send NACKDATA if data is wrong. resend data if NACKDATA is received.

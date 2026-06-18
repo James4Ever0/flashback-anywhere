@@ -1,0 +1,5 @@
+read ../reference_serial_transfer
+
+implement the arduino sketch and python client here.
+
+remember to include arduino and python libraries and versions. repo link maybe.

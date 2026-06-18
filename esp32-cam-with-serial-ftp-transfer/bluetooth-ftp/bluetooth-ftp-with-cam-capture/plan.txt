@@ -1,0 +1,175 @@
+Plan: Add Camera Capture Loop to bluetooth-ftp-with-cam-capture.ino
+===============================================================
+
+Goal
+----
+Fill the `void loop()` in `bluetooth-ftp-with-cam-capture.ino` with a non-blocking
+camera capture loop that:
+  - captures a photo at a fixed interval (default 30 seconds)
+  - stores the photo to SD card
+  - loads the interval value from an SD card config file
+  - shares the same SD I/O mutex with the Bluetooth FTP task
+  - never blocks the Bluetooth FTP task running on core 0
+
+Architecture
+------------
+The existing project already has:
+  - `sd_lock.h` / `sd_lock.cpp` — a FreeRTOS mutex for SD access
+  - `ftp_commands.cpp` — acquires/releases the lock around every SD operation
+  - `taskBluetoothFTP` — runs pinned to core 0
+  - `taskBootButton` — runs pinned to core 1
+
+The camera capture will run in `loop()` on core 1 (Arduino main loop).
+Because `loop()` and `taskBootButton` both run on core 1, the capture logic
+can live directly in `loop()` — no extra task needed.
+
+Steps
+-----
+
+1. Create `camera_config.h` / `camera_config.cpp`
+   (borrow parsing logic from `refactored_configurable_timelapse_sketch/app_config.cpp`)
+
+   - Define a struct `CamConfig` with fields:
+       uint32_t intervalSec    // default 30
+       uint8_t  jpegQuality    // default 10
+       uint16_t frameSize      // default FRAMESIZE_SXGA
+       uint32_t pictureNumber  // default 0
+
+   - Define `CONFIG_PATH` as `/cam_config.txt` (separate from any BT config).
+
+   - Implement `loadCamConfig(fs::FS& fs, CamConfig& out)`:
+       * set defaults first
+       * open `/cam_config.txt` from SD
+       * parse `key=value` lines (interval, jpegQuality, frameSize, pictureNumber)
+       * if file missing, create it with defaults
+       * log loaded values to Serial
+
+   - Implement `writeCamConfig(fs::FS& fs, const CamConfig& cfg)`:
+       * write human-readable key=value file with comments
+
+   - Implement helpers `frameSizeToString()` and `stringToFrameSize()`
+     (same switch logic as refactored project).
+
+2. Create `camera_capture.h` / `camera_capture.cpp`
+   (borrow from `refactored_configurable_timelapse_sketch/camera_manager.cpp`)
+
+   - Define AI-Thinker pin mappings (or include a `pins.h`).
+
+   - Implement `bool initCamera(const CamConfig& cfg)`:
+       * fill `camera_config_t` with AI-Thinker pins
+       * set pixel_format = PIXFORMAT_JPEG
+       * use PSRAM if available (fb_count=2), else fallback (fb_count=1, SVGA)
+       * apply jpeg_quality and frame_size from cfg
+       * call `esp_camera_init()`
+       * apply sensor settings (brightness, contrast, saturation, hmirror, vflip, etc.)
+       * return true on success
+
+   - Implement `bool captureImageBuffer(camera_fb_t** outFb)`:
+       * warm-up: discard N frames with small delays between them
+       * capture one frame with `esp_camera_fb_get()`
+       * return buffer pointer; caller must release it
+
+   - Implement `void releaseImageBuffer(camera_fb_t* fb)`:
+       * call `esp_camera_fb_return(fb)`
+
+3. Modify `bluetooth-ftp-with-cam-capture.ino`
+
+   a. Add includes:
+      #include "camera_capture.h"
+      #include "camera_config.h"
+      #include "esp_camera.h"
+
+   b. Add globals:
+      static CamConfig g_camConfig;
+      static unsigned long g_lastCaptureMs = 0;
+      static bool g_cameraOk = false;
+      static uint32_t g_captureIntervalMs;   // loaded from config
+
+   c. In `setup()`, AFTER SD mount and BEFORE creating tasks:
+      - wrap in `sdLockTake()` / `sdLockGive()`:
+          loadCamConfig(SD_MMC, g_camConfig);
+      - compute `g_captureIntervalMs = g_camConfig.intervalSec * 1000UL;`
+      - call `g_cameraOk = initCamera(g_camConfig);`
+      - if camera init fails, print error but do NOT halt — FTP should still work
+
+   d. In `loop()`, replace `vTaskDelay(portMAX_DELAY)` with:
+
+      ```cpp
+      void loop() {
+        if (!g_cameraOk) {
+          vTaskDelay(pdMS_TO_TICKS(1000));
+          return;
+        }
+
+        unsigned long now = millis();
+        if (now - g_lastCaptureMs >= g_captureIntervalMs) {
+          g_lastCaptureMs = now;
+
+          // --- Capture (no SD lock needed, camera has its own buffer) ---
+          camera_fb_t* fb = nullptr;
+          if (!captureImageBuffer(&fb)) {
+            Serial.println("[CAM] Capture failed.");
+            return;
+          }
+
+          // --- Build filename ---
+          g_camConfig.pictureNumber++;
+          String path = "/picture" + String(g_camConfig.pictureNumber) + ".jpg";
+
+          // --- Store under SD lock ---
+          sdLockTake();
+          File f = SD_MMC.open(path, FILE_WRITE);
+          bool written = false;
+          if (f) {
+            written = (f.write(fb->buf, fb->len) == fb->len);
+            f.close();
+          }
+          sdLockGive();
+
+          releaseImageBuffer(fb);
+
+          if (written) {
+            Serial.printf("[CAM] Saved %s (%u bytes)\n", path.c_str(), fb->len);
+
+            // Persist updated pictureNumber under SD lock
+            sdLockTake();
+            writeCamConfig(SD_MMC, g_camConfig);
+            sdLockGive();
+          } else {
+            Serial.printf("[CAM] FAILED to save %s\n", path.c_str());
+          }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+      ```
+
+4. Important concurrency rules
+   - Always acquire `sdLockTake()` before ANY SD_MMC operation.
+   - Always release `sdLockGive()` as soon as the operation is done.
+   - Camera buffer capture (`esp_camera_fb_get`) does NOT touch SD —
+     it is safe to do outside the lock.
+   - Keep lock hold time short: write file, close, then release.
+   - The `loop()` yields every 100 ms via `vTaskDelay`, so core 1 remains
+     responsive and the BT task on core 0 is unaffected.
+
+5. Config file format (`/cam_config.txt` on SD)
+
+   ```
+   # ESP32-CAM Capture Config
+   interval=30
+   jpegQuality=10
+   frameSize=SXGA
+   pictureNumber=0
+   ```
+
+   Users can edit this file on the SD card to change interval without
+   recompiling. On next boot, the new values are loaded.
+
+6. Build / flash verification checklist
+   - [ ] Compile succeeds with all new files
+   - [ ] SD config file is created if missing
+   - [ ] Camera captures at 30-second interval (or value from config)
+   - [ ] FTP LIST / READ / STORE / DELETE still work while capture is running
+   - [ ] Photos appear on SD with incrementing numbers
+   - [ ] pictureNumber persists across reboots

@@ -1,0 +1,13 @@
+# ESP32-CAM Serial File Transfer Client
+# Python dependencies
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Library info:
+#   pyserial  — https://pypi.org/project/pyserial/   (BSD license)
+#   xmodem    — https://pypi.org/project/xmodem/     (MIT license)
+#             — https://github.com/tehmaze/xmodem
+
+pyserial>=3.5
+xmodem>=0.4.7

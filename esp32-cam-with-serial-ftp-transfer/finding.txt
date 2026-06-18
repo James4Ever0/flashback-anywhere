@@ -1,0 +1,6 @@
+[tui] Device error: Expected CHECKSUM, got: '����\x00\x10JFIF\x00\x01\x01\x01\x00\x00\x00\x00\x00\x00��\x00C\x00'
+[tui] Disconnecting...
+[lib] disconnect() called
+[lib] Closing serial port /dev/ttyUSB0
+[lib] Disconnected
+[tui] Done.

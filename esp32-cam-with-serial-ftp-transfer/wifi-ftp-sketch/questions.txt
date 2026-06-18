@@ -1,0 +1,3 @@
+the wifi now starts as ESP_F7541 with no password. where is the password and ap name settings?
+
+also the ftp server seems to be empty, nothing in the sd card attached to it.

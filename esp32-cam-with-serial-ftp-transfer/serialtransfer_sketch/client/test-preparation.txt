@@ -1,0 +1,7 @@
+when uploading the program, unplug the sd card
+
+when testing the program, plug in the sd card
+
+remember to reboot the board before running any test script.
+
+be extra careful with the cam above the sd card slot since it is not very sturdy

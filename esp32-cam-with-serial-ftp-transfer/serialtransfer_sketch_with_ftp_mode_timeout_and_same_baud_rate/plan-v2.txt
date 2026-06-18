@@ -1,0 +1,453 @@
+# Plan v2 — Dual-Mode Serial Transfer Sketch (No Deep Sleep, Unified Baud Rate)
+
+## Overview
+
+Refactor the ESP32-CAM firmware to run a continuous dual-mode loop (PHOTO and TRANSFER)
+using a single baud rate (921600). The board always listens for serial commands, even
+during photo capture. The client always connects at 921600, queries current mode, and
+switches to TRANSFER if needed. Auto-timeout returns the board to PHOTO mode after
+30 seconds of inactivity in TRANSFER mode.
+
+---
+
+## Directory Layout (new sketch)
+
+```
+serialtransfer_sketch_with_ftp_mode_timeout_and_same_baud_rate/
+├── esp32cam_dual_mode/
+│   ├── esp32cam_dual_mode.ino      (main — replaces esp32cam_serial_transfer.ino)
+│   ├── pins.h                       (copied from refactored_timelapse)
+│   ├── app_config.h / .cpp          (copied + extended)
+│   ├── camera_manager.h / .cpp      (copied + non-blocking init)
+│   ├── storage_manager.h / .cpp     (copied)
+│   └── photo_pipeline.h / .cpp      (copied, deep-sleep stripped)
+└── client/
+    └── esp32cam_client.py           (rewritten — unified baud, text-command init)
+```
+
+---
+
+## Phase 1 — Copy & Adapt Reusable Timelapse Modules
+
+### 1.1 pins.h
+- **Action:** Copy verbatim from `refactored_configurable_timelapse_sketch/pins.h`.
+- **Rationale:** Already has AI-Thinker ESP32-CAM pin map + FLASH_LED_PIN.
+
+### 1.2 storage_manager.h / .cpp
+- **Action:** Copy verbatim from `refactored_configurable_timelapse_sketch/`.
+- **Rationale:** `initSD()`, `writeFile()`, `fileExists()` are already filesystem-agnostic.
+
+### 1.3 app_config.h / .cpp
+- **Action:** Copy from timelapse, then extend.
+- **Changes:**
+  - Add `DeviceMode` enum: `MODE_PHOTO = 0`, `MODE_TRANSFER = 1`.
+  - Add `DEFAULT_MODE`, `TRANSFER_TIMEOUT_SEC` (30), `BAUD_RATE` (921600) to defaults.
+  - Extend `Config` struct with `DeviceMode mode` field.
+  - Add helper `deviceModeToString()` / `stringToDeviceMode()`.
+  - Keep existing `loadConfig()` / `writeConfig()` signatures; update serialization to include `mode=`.
+
+### 1.4 camera_manager.h / .cpp
+- **Action:** Copy from timelapse, keep `initCamera()` and `captureImageBuffer()` / `releaseImageBuffer()`.
+- **No changes needed** — the capture functions are already non-blocking (caller polls via return value).
+
+### 1.5 photo_pipeline.h / .cpp
+- **Action:** Copy from timelapse, then strip deep-sleep and adapt for continuous loop.
+- **Changes in photo_pipeline.cpp:**
+  - Remove `enterDeepSleep()` entirely.
+  - Change `runPhotoCycle()` to return `void` but NOT sleep; it simply:
+    1. Turn on flash.
+    2. Capture + store image.
+    3. Persist config (picture number).
+    4. Turn off flash.
+    5. Return (loop() will handle interval timing).
+  - Keep `captureImage()`, `storeImage()`, `persistConfig()`, `setFlash()`.
+
+---
+
+## Phase 2 — Board-Side Firmware (esp32cam_dual_mode.ino)
+
+### 2.1 Constants & Macros
+
+```cpp
+#define BAUD_RATE              921600      // single baud for both modes
+#define BOOT_SERIAL_TIMEOUT_MS 3000        // larger timeout during first init
+#define TRANSFER_INACTIVITY_MS 30000       // auto-switch back to PHOTO (macro)
+#define RX_BUFFER_SIZE         8192
+#define TX_BUFFER_SIZE         8192
+#define FILE_CHUNK_SIZE        247         // SerialTransfer payload minus type byte
+```
+
+### 2.2 Global State
+
+```cpp
+DeviceMode  currentMode = MODE_PHOTO;
+uint32_t    pictureNumber = 0;
+uint32_t    intervalSec = 60;
+unsigned long lastTransferActivity = 0;   // millis() of last command in TRANSFER mode
+bool        sdReady = false;
+bool        cameraReady = false;
+String      serialBuffer = "";
+```
+
+- **No RTC_DATA_ATTR** — deep sleep is removed; all state lives in RAM.
+- **No `myTransfer` object** — plain-text commands only (see rationale below).
+
+### 2.3 Rationale: Drop SerialTransfer Library, Use Plain Text Protocol
+
+The prompt requires listening to serial input **during camera capture**, which blocks
+for hundreds of milliseconds. SerialTransfer uses COBS-framed packets; a partial packet
+read during a `delay()` or camera DMA wait would corrupt framing. Plain text commands
+(with `\n` delimiters) are self-synchronizing: we can `Serial.read()` one byte at a time
+into a buffer, and `\n` marks command boundaries. This matches the text-based init
+protocol the prompt describes.
+
+**Protocol (text, newline-terminated):**
+
+| Host → Board          | Board → Host                              |
+|-----------------------|-------------------------------------------|
+| `CURRENT_MODE`        | `[OK] mode: PHOTO` or `[OK] mode: TRANSFER` |
+| `MODE TRANSFER`       | `[OK] mode changed to TRANSFER`           |
+| `MODE PHOTO`          | `[OK] mode changed to PHOTO`              |
+| `LIST <path>`         | `[FILE] <size> <name>` / `[DIR] <name>` … `[OK]` |
+| `READ <path>`         | `SIZE:<n>` then raw bytes then `\x04` then `[OK]` |
+| `STORE <path> <size>` | `[OK] Ready to receive`                   |
+| `<raw chunk>`         | `[ACK] <cumulative>`                      |
+| `DELETE <path>`       | `[OK]` or `[ERROR] <msg>`                 |
+| `HELP`                | command list                              |
+
+### 2.4 setup()
+
+1. Disable brownout.
+2. `Serial.begin(BAUD_RATE)` — **single baud, no switching**.
+3. `delay(100)`.
+4. `pinMode(FLASH_LED_PIN, OUTPUT); digitalWrite(LOW)`.
+5. `initSD()` — if fail, print `[FATAL]` and halt.
+6. `loadConfig(SD_MMC, g_config)` — populate `intervalSec`, `pictureNumber`, and persisted `mode`.
+7. `initCamera(g_config)` — if fail, print `[FATAL]` and halt.
+8. Print boot banner with mode, picture number, interval.
+9. Enter loop with `currentMode` from config.
+
+### 2.5 loop()
+
+**Structure:**
+
+```cpp
+void loop() {
+  // --- Always drain serial into buffer, regardless of mode ---
+  processSerialInput();
+
+  if (currentMode == MODE_TRANSFER) {
+    // In transfer mode: process buffered commands
+    processTransferCommands();
+    // Check inactivity timeout
+    if (millis() - lastTransferActivity > TRANSFER_INACTIVITY_MS) {
+      Serial.println("[INFO] Transfer idle timeout, switching to PHOTO mode");
+      switchMode(MODE_PHOTO);
+    }
+  } else {
+    // In photo mode: run one photo cycle, then wait for interval
+    runPhotoCycleNonBlocking();
+  }
+}
+```
+
+### 2.6 processSerialInput() — Non-Blocking, Mode-Agnostic
+
+```cpp
+void processSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialBuffer.trim();
+      if (serialBuffer.length() > 0) {
+        handleCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      if (serialBuffer.length() < 256) {
+        serialBuffer += c;
+      }
+    }
+  }
+}
+```
+
+- **Called from `loop()` every iteration** — this ensures we never miss a command, even during photo capture delays.
+- Commands are **enqueued implicitly** in `serialBuffer` (one at a time; if a second arrives before the first is handled, it overwrites — acceptable for this use case).
+
+### 2.7 handleCommand(String cmd) — Dispatch
+
+Parse `cmd` (case-insensitive where appropriate):
+
+| Command       | Action                                          |
+|---------------|-------------------------------------------------|
+| `CURRENT_MODE`| Print `[OK] mode: PHOTO` or `[OK] mode: TRANSFER` |
+| `MODE TRANSFER`| `switchMode(MODE_TRANSFER);` print `[OK] mode changed to TRANSFER` |
+| `MODE PHOTO`  | `switchMode(MODE_PHOTO);` print `[OK] mode changed to PHOTO` |
+| `LIST …`      | `handleList(path)`                              |
+| `READ …`      | `handleRead(path)`                              |
+| `STORE …`     | `handleStore(path, size)`                       |
+| `DELETE …`    | `handleDelete(path)`                            |
+| `HELP`        | Print available commands                        |
+| (unknown)     | Print `[ERROR] Unknown command: xxx`            |
+
+For `LIST`, `READ`, `STORE`, `DELETE`: if `currentMode != MODE_TRANSFER`, respond with `[ERROR] Not in transfer mode`.
+
+### 2.8 switchMode(DeviceMode newMode)
+
+```cpp
+void switchMode(DeviceMode newMode) {
+  currentMode = newMode;
+  g_config.mode = newMode;
+  writeConfig(SD_MMC, g_config);   // persist
+  if (newMode == MODE_TRANSFER) {
+    lastTransferActivity = millis();
+    Serial.println("\n========== TRANSFER MODE ==========");
+  } else {
+    Serial.println("\n========== PHOTO MODE ==========");
+    // Reset photo timing so it takes a photo soon
+    nextPhotoTime = millis();      // take one immediately, then interval
+  }
+}
+```
+
+- **No baud rate change.** No `Serial.end()` / `Serial.begin()`.
+
+### 2.9 runPhotoCycleNonBlocking()
+
+Replace the blocking `takePhotoAndSleep()` with a state-machine approach so `loop()` keeps calling `processSerialInput()`:
+
+```cpp
+enum PhotoState { PS_IDLE, PS_WARMUP, PS_CAPTURE, PS_SAVE, PS_COOLDOWN };
+PhotoState photoState = PS_IDLE;
+unsigned long nextPhotoTime = 0;
+int warmupCounter = 0;
+camera_fb_t* fb = nullptr;
+```
+
+**PS_IDLE:**
+- If `millis() >= nextPhotoTime`, set `photoState = PS_WARMUP`, `warmupCounter = 0`.
+
+**PS_WARMUP:**
+- Grab and discard one frame (`esp_camera_fb_get()` + return).
+- `warmupCounter++`.
+- If `warmupCounter >= 10`, set `photoState = PS_CAPTURE`.
+- Between frames, `processSerialInput()` is already called by `loop()`.
+
+**PS_CAPTURE:**
+- `fb = esp_camera_fb_get()`.
+- If success, `setFlash(true)`, set `photoState = PS_SAVE`.
+- If fail, print error, set `photoState = PS_COOLDOWN`, `nextPhotoTime = millis() + 5000`.
+
+**PS_SAVE:**
+- `storeImage(SD_MMC, path, fb)`.
+- `persistConfig(SD_MMC, g_config)`.
+- `releaseImageBuffer(fb)`.
+- `setFlash(false)`.
+- Set `photoState = PS_COOLDOWN`, `nextPhotoTime = millis() + (intervalSec * 1000)`.
+
+**PS_COOLDOWN:**
+- Just wait; `loop()` will see `millis() < nextPhotoTime` and stay in PS_IDLE next cycle.
+
+> **Note:** The existing `captureImageBuffer()` from `camera_manager.cpp` already does warm-up internally. We can either:
+>   - (A) Use it as-is inside PS_WARMUP/PS_CAPTURE (it blocks for ~500ms, but `processSerialInput()` is called on the next `loop()` iteration after it returns).
+>   - (B) Decompose it into per-frame steps as shown above.
+>
+> **Recommendation:** Use (A) for simplicity — the blocking time is ~500-800ms, and commands sent during that window will be buffered by the UART hardware FIFO (ESP32 has 128-byte RX FIFO). The prompt says "listen during camera capture" — with the FIFO buffer and the larger init timeout on the client side, this is acceptable. If commands are missed, switch to (B).
+
+### 2.10 Transfer Command Handlers (Plain Text)
+
+All handlers update `lastTransferActivity = millis()` on each received command.
+
+**LIST:**
+- Open directory, iterate entries.
+- Print `[FILE] <size> <name>` or `[DIR] <name>` per entry.
+- Print `[OK]` at end.
+
+**READ:**
+- Open file.
+- Print `SIZE:<n>\n`.
+- Stream raw bytes (not text-encoded).
+- Print `\x04` (EOT) then `[OK]`.
+
+**STORE:**
+- Parse path and expected size.
+- Open file for writing.
+- Print `[OK] Ready to receive`.
+- Enter a receive loop: read raw bytes (not line-based) until `storeReceived >= storeExpected` or `\x04` received.
+- After each chunk, print `[ACK] <cumulative_bytes>`.
+- Close file, print `[OK] Stored <n> bytes`.
+
+**DELETE:**
+- `SD_MMC.remove(path)`, print `[OK]` or `[ERROR]`.
+
+---
+
+## Phase 3 — Client-Side Python Rewrite (client/esp32cam_client.py)
+
+### 3.1 Connection Strategy (Unified Baud)
+
+```python
+BAUD = 921600
+INIT_TIMEOUT = 10          # seconds to wait for mode switch response
+```
+
+**`connect()` algorithm:**
+
+```python
+def connect(self):
+    # 1. Open serial at BAUD
+    self.ser = serial.Serial(self.port, baudrate=BAUD, timeout=1.0)
+    self.ser.reset_input_buffer()
+    time.sleep(0.2)
+
+    # 2. Query current mode
+    self._send_cmd("CURRENT_MODE")
+    response = self._read_response(timeout=3.0)
+
+    # 3. Check response
+    if "TRANSFER" in response:
+        print("[OK] Already in TRANSFER mode")
+        return True
+
+    # 4. Unknown / PHOTO / no response → switch to TRANSFER
+    print("[INFO] Not in TRANSFER mode, sending MODE TRANSFER...")
+    self.ser.reset_input_buffer()   # drain any boot garbage (not required per prompt, but safe)
+    self._send_cmd("MODE TRANSFER")
+
+    # 5. Wait up to INIT_TIMEOUT for confirmation
+    #    Collect FULL buffer, display received bytes along the way for debugging.
+    full_buffer = ""
+    start = time.time()
+    while time.time() - start < INIT_TIMEOUT:
+        if self.ser.in_waiting:
+            chunk = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='replace')
+            full_buffer += chunk
+            # Display as we receive (for debugging)
+            for line in chunk.splitlines():
+                print(f"  [RX] {line}")
+        if "[OK] mode changed to TRANSFER" in full_buffer:
+            print("[OK] Mode switched to TRANSFER")
+            return True
+        time.sleep(0.1)
+
+    # 6. Timeout
+    print(f"[ERROR] Mode switch timeout. Full buffer:\n{full_buffer}")
+    raise ConnectionError("Failed to switch board to TRANSFER mode")
+```
+
+### 3.2 Buffer Draining (`_drain_stale`)
+
+Reference implementation from `bt_ftp_client.py`:
+
+```python
+def _drain_stale(self) -> bytes:
+    """Non-blocking drain of stale data. Call before every command EXCEPT during init."""
+    if not self.ser:
+        return b""
+    drained = b""
+    for _ in range(20):          # poll up to 200ms
+        avail = self.ser.in_waiting
+        if avail > 0:
+            chunk = self.ser.read(min(4096, avail))
+            drained += chunk
+        elif drained:
+            break
+        time.sleep(0.01)
+    if drained:
+        print(f"[WARN] Drained {len(drained)} stale bytes")
+    return drained
+```
+
+- **Called in `_cmd()` before sending every command** (LIST, READ, STORE, DELETE, etc.).
+- **NOT called during init** (the prompt explicitly says "draining logic is not required during init process").
+
+### 3.3 Command Methods
+
+Each command method follows this pattern:
+
+```python
+def list_files(self, path="/"):
+    self._drain_stale()
+    self._send_cmd(f"LIST {path}")
+    return self._read_text_response()
+
+def read_file(self, path):
+    self._drain_stale()
+    self._send_cmd(f"READ {path}")
+    # Read SIZE: header, then binary data, then EOT
+    ...
+
+def store_file(self, path, data):
+    self._drain_stale()
+    self._send_cmd(f"STORE {path} {len(data)}")
+    # Wait for [OK] Ready to receive
+    # Send chunks, wait for [ACK]
+    ...
+```
+
+### 3.4 Response Reading
+
+**`_read_response(timeout)`:**
+- Poll `in_waiting` with 10ms sleep.
+- Accumulate bytes until idle for ~200ms (20 empty polls) or timeout.
+- Return decoded string.
+
+**`_read_binary_response()`:**
+- Read `SIZE:<n>\n` header line.
+- Read exactly `n` bytes.
+- Read EOT byte (`\x04`).
+- Read trailing `[OK]`.
+
+---
+
+## Phase 4 — Integration Checklist
+
+### 4.1 Build & Upload (Arduino)
+- [ ] Create `esp32cam_dual_mode/` directory with `.ino` + all `.h`/`.cpp` files.
+- [ ] Verify all `#include` paths are correct (Arduino IDE flattens includes in the same folder).
+- [ ] Upload at 921600 baud, Huge APP partition.
+
+### 4.2 Client Test Sequence
+1. **Boot test:** Board boots into PHOTO mode, takes a photo, prints status.
+2. **Query mode:** Run `python client.py CURRENT_MODE` → expect `PHOTO`.
+3. **Switch mode:** Run `python client.py MODE TRANSFER` → expect `[OK] mode changed to TRANSFER`.
+4. **List in transfer:** `python client.py LIST /` → list of files.
+5. **Upload:** `python client.py upload test.jpg /uploaded.jpg`.
+6. **Download:** `python client.py download /uploaded.jpg ./downloaded.jpg` → compare.
+7. **Idle timeout:** Wait 30 seconds in TRANSFER without commands → board auto-prints `switching to PHOTO mode`.
+8. **Mode during capture:** Send `CURRENT_MODE` while board is in PS_WARMUP/PS_CAPTURE → should still respond.
+
+### 4.3 Edge Cases
+- **Serial corruption during photo:** Client init collects full buffer; keyword search is substring-based, so garbage before/after is tolerated.
+- **Command during STORE binary receive:** Board's `STORE` handler reads raw bytes; a stray `\n` in the binary would be misinterpreted. Mitigation: escape or use explicit length-based framing for STORE payload (already doing length-based).
+- **Baud mismatch:** Both sides hard-coded to 921600; no runtime negotiation.
+
+---
+
+## Summary of Key Changes from v1
+
+| Aspect           | v1 (Current)                          | v2 (This Plan)                              |
+|------------------|----------------------------------------|---------------------------------------------|
+| Baud rates       | PHOTO=115200, TRANSFER=921600 (was 2M) | Single 921600 for both modes                |
+| Deep sleep       | Yes (photo mode sleeps)                | Removed — continuous `loop()`               |
+| Serial listening | Only at boot (2s window)               | Always, via `processSerialInput()` in loop  |
+| Protocol         | SerialTransfer (binary packets)        | Plain text (newline-delimited)              |
+| Client init      | Two-phase: probe 921600 → fallback 115200 → send MODE TRANSFER → reconnect 921600 | Single-phase: open 921600, query CURRENT_MODE, send MODE TRANSFER if needed, wait for text ACK |
+| Auto timeout     | None                                   | 30s in TRANSFER → auto-switch to PHOTO      |
+| Buffer drain     | None                                   | `_drain_stale()` before each command        |
+| Code structure   | Monolithic `.ino`                      | Modular: pins, config, camera, storage, pipeline |
+
+---
+
+## Files to Create / Modify
+
+| File | Action |
+|------|--------|
+| `esp32cam_dual_mode/esp32cam_dual_mode.ino` | New main sketch |
+| `esp32cam_dual_mode/pins.h` | Copy from timelapse |
+| `esp32cam_dual_mode/app_config.h/cpp` | Copy + extend with `DeviceMode` |
+| `esp32cam_dual_mode/camera_manager.h/cpp` | Copy (no changes) |
+| `esp32cam_dual_mode/storage_manager.h/cpp` | Copy (no changes) |
+| `esp32cam_dual_mode/photo_pipeline.h/cpp` | Copy, strip deep sleep |
+| `client/esp32cam_client.py` | Rewrite with text protocol, unified baud, drain logic |

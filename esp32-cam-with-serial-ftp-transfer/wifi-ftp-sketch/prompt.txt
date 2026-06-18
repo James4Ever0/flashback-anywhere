@@ -1,0 +1,3 @@
+refer to ../CombinedSketch to understand how we do mode switch. you transfer wifi name and wifi password to esp32cam to setup wifi and ftp server. ftp server can only be enabled if sd card is mounted. ftp server port, username and password can also be configured using serial.
+
+you name the file or library to be downloaded from, you only write the code at here.

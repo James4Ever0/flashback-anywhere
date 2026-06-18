@@ -1,0 +1,9 @@
+create a plan for the job
+
+read README.md
+
+split the code into two files, one called "lib.py" one called "tui.py"
+
+tui is for terminal ui interactions. lib is for external code library call.
+
+

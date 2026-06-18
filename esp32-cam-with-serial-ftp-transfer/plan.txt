@@ -1,0 +1,157 @@
+# Plan: Combine Two INO Files into One
+
+## Overview
+Merge the photo-capture+deep-sleep sketch and the serial-ftp file-transfer sketch into a single unified INO that can operate in two modes and switch between them dynamically.
+
+---
+
+## Phase 1: Analyze Existing Sketches
+
+1. Review both .ino files to identify:
+   - Setup/loop structures
+   - Shared libraries and pin usage
+   - State machines or blocking loops
+   - Deep sleep wakeup sources in the photo sketch
+   - Serial command protocol in the FTP sketch
+
+2. Document overlap and conflicts:
+   - Camera initialization (shared)
+   - SD card usage (shared)
+   - Serial port usage (may conflict if both use Serial for debug + commands)
+
+---
+
+## Phase 2: Design Unified Architecture
+
+### Core Pattern: State Machine
+Replace both blocking loops with a single non-blocking state machine in `loop()`.
+
+States:
+- `STATE_PHOTO_MODE`    — periodic photo capture + deep sleep
+- `STATE_TRANSFER_MODE` — serial command loop for file operations
+- `STATE_MODE_SWITCH`   — transitional state during mode change
+
+### Mode Switch Triggers (checked every wake/loop iteration)
+
+| Trigger          | Detection Method                                           |
+|------------------|------------------------------------------------------------|
+| Battery charging | Read GPIO tied to charging IC (e.g., IP5306 STAT pin)      |
+| Button pressed   | GPIO interrupt or polled digital input                     |
+| Serial command   | Parse incoming serial string for a "enter-transfer" token  |
+
+All triggers should be checked at startup and periodically in `loop()`.
+
+---
+
+## Phase 3: Implement Startup & Configuration
+
+1. On boot / wake from deep sleep:
+   - Initialize Serial
+   - Initialize SD card
+   - Read `/config.txt` from SD card if present:
+     - `shot_interval_seconds=60`
+     - `default_mode=photo`
+   - Initialize camera (shared init for both modes)
+   - Check mode-switch triggers
+   - Enter appropriate state
+
+2. Persistent state across deep sleep:
+   - Use RTC memory (or RTC fast/slow memory) to store:
+     - Current mode
+     - Shot counter
+     - Next scheduled wake time
+   - This avoids reverting to photo mode unintentionally on wake
+
+---
+
+## Phase 4: Photo Mode Implementation
+
+- Read `shot_interval` from SD config (fallback to default)
+- Capture image to SD card (`/DCIM/IMG_xxxxx.jpg`)
+- Increment shot counter in RTC memory
+- Set deep sleep timer for `shot_interval` seconds
+- Enter `esp_deep_sleep_start()`
+
+Wakeup sources:
+- `esp_sleep_enable_timer_wakeup(interval_us)` — primary wakeup for next shot
+- `esp_sleep_enable_ext0_wakeup(BUTTON_GPIO, level)` — button override
+- On wake, check GPIO charging status before deciding next state
+
+---
+
+## Phase 5: Transfer Mode Implementation
+
+- Enter a command-parse loop in `loop()` (no deep sleep)
+- Serial protocol (text-based, line-terminated with `\n`):
+  - `STORE <filename> <size>\n` → read <size> bytes, write to SD
+  - `READ <filename>\n`         → respond with file size, then stream bytes
+  - `DELETE <filename>\n`       → delete file, respond OK/ERR
+  - `MODE PHOTO\n`              → switch back to photo mode
+  - `LIST <path>\n`             → optional: list files on SD
+- Use a simple framing protocol or base64 if raw binary over serial is problematic
+- Keep-alive timeout: if no command for N minutes, optionally sleep or stay awake
+
+---
+
+## Phase 6: Mode Switching Logic
+
+```
+on boot / wake:
+    if charging_pin == HIGH:
+        enter_transfer_mode()
+    else if button_was_pressed():
+        toggle_mode()
+    else if serial_has_command("ENTER_TRANSFER"):
+        enter_transfer_mode()
+    else if rtc_state.mode == TRANSFER:
+        enter_transfer_mode()
+    else:
+        enter_photo_mode()
+```
+
+- `enter_photo_mode()`: set RTC state, capture photo, schedule sleep, sleep
+- `enter_transfer_mode()`: set RTC state, begin serial command loop
+- Button in transfer mode: if pressed, switch to photo mode and sleep
+
+---
+
+## Phase 7: Serial Debug vs. Command Channel
+
+Options to resolve Serial conflict:
+- **Option A**: Use `Serial` for commands (no debug prints in transfer mode), `Serial2` or separate UART for debug
+- **Option B**: Use a protocol delimiter so debug lines are ignored by host parser
+- **Option C**: Dual-phase boot — first 2 seconds listen for serial trigger; if none, photo mode with minimal debug
+
+Recommended: Option C for simplicity, or Option A if a second UART is available.
+
+---
+
+## Phase 8: Build & Test Checklist
+
+- [ ] Both original sketches compile independently
+- [ ] Unified sketch compiles
+- [ ] Photo mode: captures to SD, sleeps, wakes, captures again
+- [ ] Config file read correctly on boot
+- [ ] Transfer mode: STORE, READ, DELETE all functional
+- [ ] Charging detection switches to transfer mode
+- [ ] Button press toggles mode
+- [ ] Serial command triggers mode switch
+- [ ] Mode persists correctly across deep sleep cycles
+- [ ] No SD card corruption on mode switch
+
+---
+
+## File Structure
+
+```
+CombinedSketch/
+├── CombinedSketch.ino       # main file
+├── config.h                 # pins, intervals, commands
+├── mode_photo.cpp/.h        # photo mode logic
+├── mode_transfer.cpp/.h     # serial file transfer logic
+├── sd_utils.cpp/.h          # shared SD helpers
+├── camera_utils.cpp/.h      # shared camera init/capture
+└── README.md                # serial protocol spec
+```
+
+If keeping as single .ino, use tabs in Arduino IDE or `#include` .h/.cpp files in the same folder.

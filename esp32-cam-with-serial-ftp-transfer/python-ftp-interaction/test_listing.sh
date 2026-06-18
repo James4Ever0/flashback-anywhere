@@ -1,0 +1,1 @@
+conda run -n snn_hebb_env --no-capture-output python tui_esp32cam.py -v /dev/ttyUSB0 list /
